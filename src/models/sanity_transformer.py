@@ -99,7 +99,20 @@ class SanityTransformerAdapter(ModelAdapter):
         x = torch.from_numpy(self.tokenizer.transform(train))
         y = torch.tensor(train["_target"].to_numpy(dtype="float32"))
         opt = torch.optim.AdamW(self.model.parameters(), lr=float(s["learning_rate"]), weight_decay=0.01)
-        loss_fn = nn.BCEWithLogitsLoss()
+        # Audit finding 4: the sampler oversamples the positive class (sampling.train_positive_share, e.g. 10%
+        # against a true ~0.6% rate) and computes an inverse-probability `_weight` per row specifically to
+        # correct for this — but that weight was previously used only at evaluation time, never in the training
+        # loss. The model was trained to predict fraud at the inflated sample rate and only *scored* as if it
+        # saw the real rate: a real train/eval distribution mismatch. class_weighting: "sample_weight" (the new
+        # default) reuses the same `_weight` column as a per-example loss weight, which is the minimal, correct
+        # fix using infrastructure that already exists. "none" reproduces the old (buggy) behavior exactly, for
+        # comparison experiments.
+        class_weighting = s.get("class_weighting", "sample_weight")
+        if class_weighting not in ("none", "sample_weight"):
+            raise ValueError(f"models.sanity_transformer.class_weighting must be 'none' or 'sample_weight', got {class_weighting!r}")
+        loss_fn = nn.BCEWithLogitsLoss(reduction="none")
+        sample_weight = (torch.tensor(train["_weight"].to_numpy(dtype="float32"))
+                         if class_weighting == "sample_weight" and "_weight" in train else None)
         g = torch.Generator().manual_seed(seed)
         history, best, best_state, bad_epochs = [], -1.0, None, 0
         t0 = time.time()
@@ -110,7 +123,12 @@ class SanityTransformerAdapter(ModelAdapter):
             for i in range(0, len(x), int(s["batch_size"])):
                 idx = perm[i:i + int(s["batch_size"])]
                 logits = self.model(x[idx].to(self.device))
-                loss = loss_fn(logits, y[idx].to(self.device))
+                losses = loss_fn(logits, y[idx].to(self.device))
+                if sample_weight is not None:
+                    w = sample_weight[idx].to(self.device)
+                    loss = (losses * w).sum() / w.sum()
+                else:
+                    loss = losses.mean()
                 opt.zero_grad(); loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 opt.step()

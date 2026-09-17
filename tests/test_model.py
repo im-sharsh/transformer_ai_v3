@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import torch
 
 from src.ingestion.roles import detect_roles, schema_for_profiling
 from src.ingestion.schema_detector import detect_schema
@@ -54,6 +55,41 @@ def test_sanity_transformer_trains_and_learns_on_full_demo_data():
     assert results["test"]["pr_auc"] is not None and results["test"]["pr_auc"] > 0.3, \
         "the synthetic fraud burst pattern is designed to be learnable"
     assert len(pv) == len(e2.frames["validation"]) and len(pt) == len(e2.frames["test"])
+
+
+def test_class_weighting_default_uses_sample_weight_and_can_be_disabled():
+    """Audit finding 4: _weight (inverse-probability correction for oversampling) was previously computed but
+    never reached the training loss. class_weighting='sample_weight' is now the default; 'none' must
+    reproduce the exact old unweighted behaviour so the two are directly comparable."""
+    from src.ingestion.demo_data import make_transactions
+    big = make_transactions(n_cards=150, days=120, seed=0)
+    e1 = _prepared_level(big, "tx_weight", "E1", rows=2000)
+    assert e1.frames["train"]["_weight"].nunique() > 1, "fixture must actually have non-uniform sample weights"
+
+    torch.manual_seed(0); np.random.seed(0)
+    weighted = SanityTransformerAdapter(CFG, device="cpu")
+    weighted.train(e1, {"epochs": 1, "batch_size": 256, "class_weighting": "sample_weight", "seed": 42})
+
+    torch.manual_seed(0); np.random.seed(0)
+    unweighted = SanityTransformerAdapter(CFG, device="cpu")
+    unweighted.train(e1, {"epochs": 1, "batch_size": 256, "class_weighting": "none", "seed": 42})
+
+    p_weighted = weighted.predict(e1.frames["test"])
+    p_unweighted = unweighted.predict(e1.frames["test"])
+    assert not np.allclose(p_weighted, p_unweighted), \
+        "sample weighting must actually change training, not silently no-op"
+
+
+def test_class_weighting_rejects_unknown_value():
+    from src.ingestion.demo_data import make_transactions
+    big = make_transactions(n_cards=80, days=60, seed=0)
+    e1 = _prepared_level(big, "tx_weight_bad", "E1", rows=1000)
+    adapter = SanityTransformerAdapter(CFG, device="cpu")
+    try:
+        adapter.train(e1, {"epochs": 1, "class_weighting": "bogus"})
+        raise AssertionError("must reject an unknown class_weighting value")
+    except ValueError as e:
+        assert "class_weighting" in str(e)
 
 
 def test_sanity_checks_fail_on_empty_data():

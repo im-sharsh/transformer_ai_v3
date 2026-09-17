@@ -96,6 +96,11 @@ models:
     dim_feedforward: 128
     dropout: 0.1
     pooling: cls             # cls | mean
+    class_weighting: sample_weight  # audit finding 4: "sample_weight" reuses the sampler's inverse-probability
+                                     # _weight column as a per-example training-loss weight, correcting for
+                                     # positive-class oversampling (sampling.train_positive_share) during
+                                     # training itself, not just at evaluation. "none" reproduces the original
+                                     # (unweighted) behaviour for direct before/after comparison.
     learning_rate: 0.0005
     batch_size: 256
     epochs: 15
