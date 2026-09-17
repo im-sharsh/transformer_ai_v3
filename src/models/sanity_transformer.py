@@ -100,14 +100,16 @@ class SanityTransformerAdapter(ModelAdapter):
         y = torch.tensor(train["_target"].to_numpy(dtype="float32"))
         opt = torch.optim.AdamW(self.model.parameters(), lr=float(s["learning_rate"]), weight_decay=0.01)
         # Audit finding 4: the sampler oversamples the positive class (sampling.train_positive_share, e.g. 10%
-        # against a true ~0.6% rate) and computes an inverse-probability `_weight` per row specifically to
-        # correct for this — but that weight was previously used only at evaluation time, never in the training
-        # loss. The model was trained to predict fraud at the inflated sample rate and only *scored* as if it
-        # saw the real rate: a real train/eval distribution mismatch. class_weighting: "sample_weight" (the new
-        # default) reuses the same `_weight` column as a per-example loss weight, which is the minimal, correct
-        # fix using infrastructure that already exists. "none" reproduces the old (buggy) behavior exactly, for
-        # comparison experiments.
-        class_weighting = s.get("class_weighting", "sample_weight")
+        # against a true ~0.6% rate) and computes an inverse-probability `_weight` per row to correct for this
+        # — but that weight was only ever used at evaluation time, never in the training loss, a real
+        # train/eval distribution mismatch. class_weighting="sample_weight" (reusing `_weight` as a per-example
+        # loss weight) was implemented as the fix, but MEASURED afterward (3 seeds, synthetic data) to cause a
+        # large, consistent PR-AUC regression at severe imbalance (confirmed in isolation on E0 alone:
+        # 0.47 -> 0.14) — reweighting toward the true rate makes the rare class's gradient signal negligible,
+        # undermining what oversampling exists to provide. "none" (the default, and the original behaviour) is
+        # empirically better on this data; "sample_weight" is kept available for direct comparison, not as a
+        # recommended setting.
+        class_weighting = s.get("class_weighting", "none")
         if class_weighting not in ("none", "sample_weight"):
             raise ValueError(f"models.sanity_transformer.class_weighting must be 'none' or 'sample_weight', got {class_weighting!r}")
         loss_fn = nn.BCEWithLogitsLoss(reduction="none")

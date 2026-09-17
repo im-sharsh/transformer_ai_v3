@@ -96,11 +96,21 @@ models:
     dim_feedforward: 128
     dropout: 0.1
     pooling: cls             # cls | mean
-    class_weighting: sample_weight  # audit finding 4: "sample_weight" reuses the sampler's inverse-probability
-                                     # _weight column as a per-example training-loss weight, correcting for
-                                     # positive-class oversampling (sampling.train_positive_share) during
-                                     # training itself, not just at evaluation. "none" reproduces the original
-                                     # (unweighted) behaviour for direct before/after comparison.
+    class_weighting: none   # audit finding 4 identified a real train/eval mismatch (the sampler oversamples
+                             # the positive class for training but only reweights for evaluation) and
+                             # "sample_weight" (reusing the sampler's _weight as a per-example loss weight)
+                             # was tried as the fix and made the DEFAULT without measuring it first — a mistake.
+                             # Measured afterward (3 seeds, synthetic data): "sample_weight" caused a large,
+                             # consistent PR-AUC regression on every level, confirmed in isolation on E0 alone
+                             # (0.47 -> 0.14). Diagnosis: at ~0.4% true prevalence, reweighting the loss back
+                             # toward the true rate makes the already-rare positive class's gradient signal
+                             # negligible relative to the abundant majority class — undermining exactly what
+                             # oversampling exists to provide. Reverted to "none" (the original, empirically
+                             # better behaviour) as the default. "sample_weight" is kept available for direct
+                             # comparison experiments (see models.sanity_transformer.class_weighting docs
+                             # in the code) but is not recommended as-is for severely imbalanced data; a
+                             # gentler correction (e.g. partial reweighting, or natural sampling + pos_weight,
+                             # the brief's own §12 Experiment 4) is unmeasured future work, not this option.
     learning_rate: 0.0005
     batch_size: 256
     epochs: 15

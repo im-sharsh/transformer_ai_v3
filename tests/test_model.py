@@ -57,10 +57,13 @@ def test_sanity_transformer_trains_and_learns_on_full_demo_data():
     assert len(pv) == len(e2.frames["validation"]) and len(pt) == len(e2.frames["test"])
 
 
-def test_class_weighting_default_uses_sample_weight_and_can_be_disabled():
+def test_class_weighting_option_actually_changes_training_and_can_be_selected():
     """Audit finding 4: _weight (inverse-probability correction for oversampling) was previously computed but
-    never reached the training loss. class_weighting='sample_weight' is now the default; 'none' must
-    reproduce the exact old unweighted behaviour so the two are directly comparable."""
+    never reached the training loss. class_weighting='sample_weight' was implemented as the fix and initially
+    made the default — then measured (3 seeds, synthetic data, outside this test) to cause a large, consistent
+    PR-AUC regression at severe class imbalance, so 'none' (the original behaviour) was restored as the
+    default. Both options remain implemented and selectable for direct comparison, which is what this test
+    guards: 'sample_weight' must actually change training, not silently no-op, whichever one is the default."""
     from src.ingestion.demo_data import make_transactions
     big = make_transactions(n_cards=150, days=120, seed=0)
     e1 = _prepared_level(big, "tx_weight", "E1", rows=2000)
