@@ -19,6 +19,7 @@ from src.ingestion.roles import (ROLE_LABELS, TASK_LABELS, TASKS, detect_roles, 
                                  schema_for_profiling, target_summary, time_summary)
 from src.ingestion.schema_detector import detect_schema
 from src.models.base import PLANNED_BACKENDS
+from src.models.sanity_transformer import SanityTransformerAdapter
 from src.preprocessing.basic_preprocessing import run_basic_preprocessing
 from src.preprocessing.cleaner import CleaningConfig
 from src.preprocessing.levels import DataPreparer, infer_roles
@@ -64,7 +65,7 @@ h2, h3 { font-weight: 600; letter-spacing: -0.005em; }
 def init_state():
     defaults = {"nav": "Dashboard", "df": None, "meta": None, "schema": None, "roles": None, "profile": None,
                 "profile_info": None, "source": None, "error": None, "quality": None, "preprocessing": None,
-                "preparer": None, "levels": None}
+                "preparer": None, "levels": None, "model": None}
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
 
@@ -103,7 +104,7 @@ def set_dataset(path: Path, source: str):
         roles = roles.with_overrides(ds.df, entity=overrides.get("entity_column"), datetime=overrides.get("datetime_column"),
                                      task=hints.get("task"))
     st.session_state.update(df=ds.df, meta=ds.metadata, schema=schema, roles=roles, profile=None, profile_info=None,
-                            quality=None, preprocessing=None, preparer=None, levels=None, source=source, error=None,
+                            quality=None, preprocessing=None, preparer=None, levels=None, model=None, source=source, error=None,
                             load_seconds=round(time.time() - t0, 1))
 
 
@@ -129,16 +130,17 @@ def sidebar():
         st.markdown("**Pipeline**")
         df, roles = st.session_state.df, st.session_state.roles
         prof, qual, prep = st.session_state.profile, st.session_state.quality, st.session_state.preprocessing
-        levels = st.session_state.levels
+        levels, model = st.session_state.levels, st.session_state.model
         steps = [("Load data", "done" if df is not None else "ready"),
                  ("Confirm schema and task", "done" if roles is not None and roles.target else ("ready" if df is not None else "wait")),
                  ("Profile", "done" if prof is not None else ("ready" if df is not None else "wait")),
                  ("Quality analysis", "done" if qual is not None else ("ready" if df is not None else "wait")),
                  ("Basic preprocessing", "done" if prep is not None else ("ready" if df is not None else "wait")),
                  ("Process E0 / E1 / E2", "done" if levels else ("ready" if df is not None else "wait")),
-                 ("Train and evaluate", "wait"), ("Compare experiments", "wait")]
+                 ("Train and evaluate", "done" if model else ("ready" if levels else "wait")),
+                 ("Compare experiments", "wait")]
         html = "".join(f'<div class="tdi-step tdi-{state}"><span class="n">{i}</span><span>{name}'
-                       f'{" <small>(later phase)</small>" if state == "wait" and i > 5 else ""}</span></div>'
+                       f'{" <small>(later phase)</small>" if state == "wait" and i > 7 else ""}</span></div>'
                        for i, (name, state) in enumerate(steps, start=1))
         st.markdown(html, unsafe_allow_html=True)
         st.divider()
@@ -180,7 +182,8 @@ def page_dashboard():
               ("Quality analysis", 2, "done" if st.session_state.quality is not None else ("ready" if df is not None else "wait")),
               ("Basic preprocessing", 2, "done" if st.session_state.preprocessing is not None else ("ready" if df is not None else "wait")),
               ("E0 / E1 / E2 processing", 3, "done" if st.session_state.levels else ("ready" if df is not None else "wait")),
-              ("Feature engineering and leakage checks", 4, "planned"), ("Built-in transformer", 5, "planned"),
+              ("Feature engineering and leakage checks", 4, "done" if st.session_state.levels else ("ready" if df is not None else "wait")),
+              ("Built-in transformer", 5, "done" if st.session_state.model else ("ready" if st.session_state.levels else "wait")),
               ("Evaluation and experiments", 6, "planned"), ("Hugging Face / Nemotron / API adapters", 7, "planned")]
     st.dataframe(pd.DataFrame([{"Stage": s, "Phase": p, "Status": {"done": "Done", "ready": "Ready to run",
                                                                    "wait": "Load data first",
@@ -283,7 +286,7 @@ def schema_editor():
                 new = new.with_overrides(df, task=task_override)
             st.session_state.roles, st.session_state.profile = new, None
             st.session_state.quality, st.session_state.preprocessing = None, None
-            st.session_state.preparer, st.session_state.levels = None, None
+            st.session_state.preparer, st.session_state.levels, st.session_state.model = None, None, None
             st.success("Schema updated. Profile again to use the changes.")
             st.rerun()
         except ValueError as e:
@@ -647,14 +650,94 @@ def render_level(preparer, level: str):
 
 def page_model():
     st.title("Model")
-    st.info("Model training is not yet implemented: the built-in transformer is planned for Phase 5, other backends for Phase 7.")
     hw = hardware()
     st.markdown(f"**Detected device:** {'CUDA GPU (' + hw['gpu_name'] + ')' if hw['cuda'] else 'CPU'}")
     for level, msg in recommendations(hw):
         (st.success if level == "ok" else st.warning)(msg)
     st.dataframe(pd.DataFrame([{"Backend": b["label"], "Description": b["description"],
-                                "Status": f"Not yet implemented (Phase {b['phase']})"} for b in PLANNED_BACKENDS]),
-                 hide_index=True, width="stretch")
+                                "Status": "Implemented" if b.get("implemented") else f"Not yet implemented (Phase {b['phase']})"}
+                               for b in PLANNED_BACKENDS]), hide_index=True, width="stretch")
+
+    st.divider()
+    st.subheader("Train the built-in Sanity Transformer")
+    st.caption("Not meant to be state of the art: it validates that a prepared level produces valid, learnable "
+              "model-ready data end to end, and gives a real (not fabricated) first read on E0 vs E1 vs E2.")
+    levels = st.session_state.levels
+    if not levels:
+        st.info("Build at least one level (E0 / E1 / E2) on the Processing page first.")
+        return
+
+    cfg = config()
+    mcfg = cfg["models"]["sanity_transformer"]
+    level = st.selectbox("Data level", list(levels), format_func=lambda l: f"{l} · {levels[l].info['name']} "
+                         f"({levels[l].info['features']} features)")
+    c = st.columns(4)
+    epochs = c[0].number_input("Epochs", min_value=1, max_value=200, value=int(mcfg["epochs"]))
+    batch_options = [64, 128, 256, 512, 1024]
+    batch_size = c[1].selectbox("Batch size", batch_options,
+                                index=batch_options.index(mcfg["batch_size"]) if mcfg["batch_size"] in batch_options else 2)
+    learning_rate = c[2].number_input("Learning rate", min_value=0.00001, max_value=0.05,
+                                      value=float(mcfg["learning_rate"]), format="%.5f")
+    patience = c[3].number_input("Patience (epochs without improvement)", min_value=1, max_value=20, value=int(mcfg["patience"]))
+
+    if st.button("Train", type="primary", key="train_model"):
+        prepared = levels[level]
+        adapter = SanityTransformerAdapter(cfg, device=hw["device"])
+        settings = {"epochs": int(epochs), "batch_size": int(batch_size), "learning_rate": float(learning_rate),
+                   "patience": int(patience)}
+        with st.spinner(f"Training on {level} ({len(prepared.frames['train']):,} training rows)…"):
+            summary = adapter.train(prepared, settings)
+            checks = adapter.sanity_checks(prepared)
+            results, _, _ = adapter.evaluate(prepared)
+        st.session_state.model = {"level": level, "adapter": adapter, "summary": summary, "checks": checks, "results": results}
+
+    trained = st.session_state.model
+    if trained:
+        render_model_results(trained)
+
+
+def _fmt_metric(v):
+    return "n/a" if v is None else (f"{v:.4f}" if isinstance(v, float) else v)
+
+
+def render_model_results(trained: dict):
+    adapter, summary, checks, results = trained["adapter"], trained["summary"], trained["checks"], trained["results"]
+    desc = adapter.describe()
+    st.caption(f"Trained on {trained['level']} · {desc['parameters']:,} parameters · device {desc['device']} · "
+              f"{summary['epochs_run']} epoch(s) in {summary['train_seconds']} s")
+
+    hist = pd.DataFrame(summary["history"]).set_index("epoch")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Training loss**")
+        st.line_chart(hist["train_loss"])
+    with c2:
+        st.markdown("**Validation PR-AUC** (used for early stopping)")
+        st.line_chart(hist["val_pr_auc"])
+
+    st.subheader("Sanity checks")
+    st.caption("Section 20: data → preprocessing → representation → forward pass → prediction, checked end to end.")
+    check_rows = [{"Check": c["check"], "Status": c["status"], "Detail": c["detail"]} for c in checks]
+    st.dataframe(pd.DataFrame(check_rows), hide_index=True, width="stretch")
+    if any(c["status"] == "fail" for c in checks):
+        st.error("Some sanity checks failed; the results below may not be meaningful.")
+
+    st.subheader("Evaluation")
+    st.caption(f"Decision threshold chosen on validation (best weighted F1): {results['threshold_from_validation']:.4f}, "
+              "applied unchanged to test. Accuracy is not shown by itself: with this class imbalance it is misleading.")
+    rows = []
+    for name, key in [("Validation", "validation"), ("Test", "test"), ("Test (unweighted)", "test_unweighted"),
+                      ("Test · known entities only", "test_known_entities")]:
+        m = results.get(key)
+        if m is None:
+            continue
+        rows.append({"Split": name, "Rows": m["n"], "Positives": m["positives"], "PR-AUC": _fmt_metric(m["pr_auc"]),
+                    "ROC-AUC": _fmt_metric(m["roc_auc"]), "Precision": _fmt_metric(m["precision"]),
+                    "Recall": _fmt_metric(m["recall"]), "F1": _fmt_metric(m["f1"])})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    cm = results["test"]["confusion_matrix"]
+    st.caption(f"Test confusion matrix (weighted to the real class balance): TP {cm['tp']:.1f} · FP {cm['fp']:.1f} · "
+              f"FN {cm['fn']:.1f} · TN {cm['tn']:.1f}")
 
 
 # ------------------------------------------------------------------ main

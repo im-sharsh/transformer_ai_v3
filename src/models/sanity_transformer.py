@@ -57,11 +57,11 @@ class SanityTransformerAdapter(ModelAdapter):
     label = "Built-in Sanity Transformer"
     description = "Small PyTorch transformer encoder; validates that prepared data is learnable. CPU-friendly."
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, device: str | None = None):
         super().__init__(config)
         self.mcfg = config["models"]["sanity_transformer"]
         self.rcfg = config["representation"]
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.tokenizer: TabularTokenizer | None = None
         self.model: SanityTransformerModel | None = None
 
@@ -89,6 +89,10 @@ class SanityTransformerAdapter(ModelAdapter):
     def train(self, prepared, settings: dict, progress=None) -> dict:
         s = {**self.mcfg, **(settings or {})}
         seed = int(s.get("seed", 42))
+        # Single-threaded: multi-threaded CPU reductions are not bit-reproducible in PyTorch, and this model is
+        # small enough that the speed cost is negligible. Without this, the same seed can give different runs
+        # (observed directly: identical settings gave val PR-AUC 0.91 in one process and 0.10 in another).
+        torch.set_num_threads(1)
         torch.manual_seed(seed); np.random.seed(seed)
         self._build(prepared)
         train, val = prepared.frames["train"], prepared.frames["validation"]
@@ -132,9 +136,21 @@ class SanityTransformerAdapter(ModelAdapter):
                 "train_seconds": round(time.time() - t0, 2), "device": self.device, "settings": s}
 
     def sanity_checks(self, prepared, max_rows: int = 5000) -> list[dict]:
+        """Runs the full pipeline (encode -> forward pass -> a short training run -> predict) as a diagnostic.
+        The short training run and its tiny sample are throwaway: this must not leave a real, already-trained
+        adapter (self.model / self.tokenizer) worse off than before the call, so the original state — if any —
+        is restored afterwards regardless of how the checks finish."""
         checks = basic_data_checks(prepared)
         if any(c["status"] == "fail" for c in checks):
             return checks
+        saved_model, saved_tokenizer = self.model, self.tokenizer
+        try:
+            return checks + self._run_pipeline_checks(prepared, max_rows)
+        finally:
+            self.model, self.tokenizer = saved_model, saved_tokenizer
+
+    def _run_pipeline_checks(self, prepared, max_rows: int) -> list[dict]:
+        checks = []
         try:
             self._build(prepared)
             enc = {sp: self.tokenizer.transform(f) for sp, f in prepared.frames.items()}

@@ -77,3 +77,21 @@ leakage:                   # Phase 4: feature-level leakage scan on E1 / E2's fi
   medium_auc: 0.95
   instability_gap: 0.10     # predictive under random folds but this much weaker on the later period: medium risk
   holdout_fraction: 0.30    # only used as a fallback if the train/validation split boundary is unavailable
+
+representation:            # Phase 5: turns E0/E1/E2 features into token ids, the same way for every level
+  numeric_bins: 16          # quantile bins per numeric feature, fitted on training rows
+  min_category_count: 5     # categorical values seen fewer times than this in training become "unknown"
+
+models:
+  sanity_transformer:       # Phase 5: built-in small Transformer (CPU-friendly; not meant to be state of the art)
+    d_model: 64
+    n_heads: 4
+    n_layers: 2
+    dim_feedforward: 128
+    dropout: 0.1
+    pooling: cls             # cls | mean
+    learning_rate: 0.0005
+    batch_size: 256
+    epochs: 15
+    patience: 3              # stop after this many epochs without a validation PR-AUC improvement
+    seed: 42

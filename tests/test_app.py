@@ -64,6 +64,31 @@ def test_demo_flow_processing():
     _no_errors(at)
 
 
+def test_demo_flow_model_training():
+    at = streamlit_testing.AppTest.from_file(APP, default_timeout=180).run()
+    at.sidebar.radio[0].set_value("Data Upload").run()
+    at.button(key="load_demo").click().run()
+    at.sidebar.radio[0].set_value("Processing").run()
+    at.button(key="prepare_split").click().run()
+    at.button(key="build_E1").click().run()
+    _no_errors(at)
+
+    at.sidebar.radio[0].set_value("Model").run()
+    _no_errors(at)
+    at.number_input[0].set_value(2).run()          # epochs: keep the headless run fast
+    at.button(key="train_model").click().run()
+    _no_errors(at)
+
+    trained = at.session_state["model"]
+    assert trained is not None and trained["level"] == "E1"
+    assert trained["summary"]["epochs_run"] <= 2
+    assert all(c["status"] != "fail" for c in trained["checks"])
+    assert 0.0 <= trained["results"]["threshold_from_validation"] <= 1.0
+
+    at.sidebar.radio[0].set_value("Dashboard").run()
+    _no_errors(at)
+
+
 def test_demo_flow_quality_and_basic_preprocessing():
     at = streamlit_testing.AppTest.from_file(APP, default_timeout=180).run()
     at.sidebar.radio[0].set_value("Data Upload").run()
