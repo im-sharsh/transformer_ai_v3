@@ -83,9 +83,11 @@ class ChangeLog:
 
 
 def next_version(processed_dir: str | Path, prefix: str = "dataset_v") -> str:
-    """dataset_v001, dataset_v002, ... Existing versions are never overwritten."""
+    """dataset_v001, dataset_v002, ... Existing versions are never overwritten. Matches on the stem, so this
+    works whether existing versions are directories (e.g. dataset_v001/) or files with an extension
+    (e.g. experiment_v001.json)."""
     processed_dir = Path(processed_dir)
     processed_dir.mkdir(parents=True, exist_ok=True)
     numbers = [int(m.group(1)) for p in processed_dir.iterdir()
-               if (m := re.fullmatch(rf"{prefix}(\d+)", p.name))]
+               if (m := re.fullmatch(rf"{prefix}(\d+)", p.stem))]
     return f"{prefix}{max(numbers, default=0) + 1:03d}"

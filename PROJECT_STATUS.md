@@ -4,7 +4,7 @@ _Read this first in every new session. Then inspect the files and re-run the tes
 
 ## Current phase
 
-**Phase 5 — built-in CPU transformer: complete.** Waiting for instruction before starting Phase 6.
+**Phase 6 — evaluation + experiment runner: complete.** Waiting for instruction before starting Phase 7.
 
 ## Cumulative summary (all phases so far)
 
@@ -16,73 +16,63 @@ schema/task detection, profiling. 17 tests.
 **Phase 3 — E0 / E1 / E2 processing:** subset selection, temporal/random split, sampling, three data levels,
 Processing UI page. 46 tests.
 
-**Phase 4 — Feature engineering + leakage checks:** the tested leakage detector wired into E1/E2, reusing the
-real train/validation cutoff, auto-removing only structural leaks. 50 tests.
+**Phase 4 — Feature engineering + leakage checks:** the tested leakage detector wired into E1/E2. 50 tests.
 
-**Phase 5 — Built-in CPU transformer (complete, this session):** see below.
+**Phase 5 — Built-in CPU transformer:** `SanityTransformerAdapter` (train/predict/evaluate/save/load), Model UI page. 56 tests.
 
-## Completed work (Phase 5, this session)
+**Phase 6 — Evaluation + experiment runner (complete, this session):** see below.
 
-- Moved `src/evaluation/metrics.py`, `src/representation/tabular_tokenizer.py`, `src/models/sanity_transformer.py`
-  from `_pending/` into `src/`.
-- **Reconciled a real interface mismatch found while inspecting the repo** (per the mandatory phase-start
-  protocol): `src/models/sanity_transformer.py` (drafted alongside `_pending/src/models/base_draft.py`) needs a
-  richer `ModelAdapter` — default `evaluate()` (threshold on validation, applied to test) and `sanity_checks()`,
-  `ModelUnavailable`, `check`/`basic_data_checks` helpers, `__init__(self, config)` — than the thin placeholder
-  Phase 1 had already committed as `src/models/base.py` (`__init__(self, config, task)`, `evaluate` abstract, no
-  shared logic). Confirmed nothing live used the old shape (`grep` — only `PLANNED_BACKENDS` was ever imported),
-  so replaced `src/models/base.py`'s `ModelAdapter` with `base_draft.py`'s, kept `PLANNED_BACKENDS` (now marking
-  `sanity_transformer` `implemented: true`), and deleted `base_draft.py` as fully superseded.
-- `SanityTransformerAdapter`: added a `device` constructor parameter (defaults to the old
-  `torch.cuda.is_available()` check) so `app.py` passes `hardware.py`'s already-detected device instead of a
-  second, independent detection; added `torch.set_num_threads(1)` in `train()`.
-- **Found and fixed a real bug, not a draft-quality issue, while debugging a flaky-looking test:** `sanity_checks()`
-  calls `self._build()` and a short throwaway `self.train()` (2 epochs, ≤5,000 rows) as part of its diagnostics,
-  and left `self.model` / `self.tokenizer` overwritten with that throwaway model afterwards. `train()` →
-  `sanity_checks()` → `evaluate()` — exactly what the Model page does — silently evaluated the throwaway model.
-  Root-caused by checksumming the synthetic data (ruled out data nondeterminism), reproducing the exact test
-  setup in isolation (ruled out import-order/environment effects), then finding the mutation. Fixed with
-  `try`/`finally` save-and-restore around `sanity_checks()`'s internals; it now has no side effects on an
-  already-trained adapter. Confirmed the fix both in `pytest` and by re-running training in a live browser
-  (validation PR-AUC 0.97, test PR-AUC 0.83, recall 0.78, precision 0.55 on the full synthetic dataset — before
-  the fix, the same run's evaluation reported PR-AUC 0.01).
-- New `representation:` and `models.sanity_transformer:` sections in `config.yaml`.
-- New "Model" page content in `app.py` (`page_model`, `render_model_results`): trains on any already-built E0/E1/E2
-  level with configurable epochs/batch size/learning rate/patience, then shows the loss and validation PR-AUC
-  curves, the sanity-check table, and validation/test/test-unweighted/test-known-entities-only metrics (PR-AUC,
-  ROC-AUC, precision, recall, F1, weighted confusion matrix) with a validation-chosen decision threshold.
-  Accuracy is deliberately not shown alone (section 16: misleading under this imbalance).
-- Sidebar pipeline tracker and Dashboard status table: "Train and evaluate" / "Built-in transformer" now reflect
-  real `st.session_state.model` state; the "(later phase)" sidebar annotation threshold moved from step 6 to
-  step 8, since steps 6 and 7 are both implemented as of this phase.
+## Completed work (Phase 6, this session)
+
+- New `src/evaluation/experiment.py` (no `_pending` draft existed for this; built directly from section 17/19
+  of the master prompt): `run_experiment`/`run_comparison` build (or reuse, via `DataPreparer`'s cache) each
+  requested level, then train and evaluate the **same** `SanityTransformerAdapter` config, seed and split on
+  each — so a difference in results comes from the data preparation, never from a different training setup.
+  `ExperimentResult` records level, rows per split, feature count, model, device, seed, settings, train/inference
+  time, epochs run, threshold and the full metrics dict. `comparison_table` renders one row per level.
+  `save_experiment`/`list_experiments` persist to `experiments/` as never-overwritten
+  `experiment_vNNN.json` manifests (dataset id, split info, all results) — section 19's "store metrics,
+  configuration... in reports/experiments/" requirement; nothing is estimated when nothing has been saved.
+- **Found and fixed a real bug in an already-shipped Phase 2 utility, hit immediately by the new code:**
+  `src/utils/audit.py`'s `next_version()` (used since Phase 2 for `data/processed/dataset_vNNN/` directories)
+  matched candidate version numbers against `p.name`. Called with a file that has an extension
+  (`experiment_v001.json`, not a bare directory `dataset_v001`), the regex never matched the existing file, so
+  every save silently reused `experiment_v001` and overwrote the previous one — caught immediately by
+  `test_experiments_are_never_overwritten`. Fixed by matching `p.stem` instead of `p.name` (identical behavior
+  for extension-less directories, correct for files with an extension); Phase 2's own usage and tests are
+  unaffected (confirmed: full suite still green).
+- New "Experiments" page (`app.py`): pick which levels to compare, shared epochs/batch size/patience settings,
+  "Run comparison" (progress reported level by level), the comparison table and a PR-AUC/F1 bar chart, and a
+  "Save this comparison" button. New "Results" page: lists every saved experiment from `experiments/` (oldest
+  session, closed laptop, whatever — it reads the files, not session state) and renders the same table/chart for
+  whichever one is selected. Both pages share one `render_experiment()` renderer.
+- Sidebar pipeline tracker and Dashboard status table: "Compare experiments" / "Evaluation and experiments" now
+  reflect real `st.session_state.experiment` state instead of always "later phase" / "planned".
 
 ## Files changed this session
 
-**New:** `tests/test_model.py`
-**Modified:** `src/models/base.py` (replaced with the richer interface), `src/models/sanity_transformer.py`
-(`device` param, single-threading), `app.py` (Model page, session state, status rows), `config.yaml`
-(`representation`, `models.sanity_transformer`), `tests/test_app.py` (new `test_demo_flow_model_training`),
-`_pending/README.md`
-**Moved (git mv, content unchanged unless noted above):** `_pending/src/evaluation/metrics.py` → `src/evaluation/`;
-`_pending/src/representation/tabular_tokenizer.py` → `src/representation/`; `_pending/src/models/sanity_transformer.py` → `src/models/`
-**Deleted:** `_pending/src/models/base_draft.py` (content merged into `src/models/base.py`)
+**New:** `src/evaluation/experiment.py`, `tests/test_experiment.py`
+**Modified:** `src/utils/audit.py` (`next_version` bug fix), `app.py` (Experiments/Results pages, removed the
+now-fully-superseded `page_placeholder`/`PHASE_OF_PAGE`, session state, status rows), `tests/test_app.py`
+(new `test_demo_flow_experiments`, updated the stale "Not run" assertion in `test_every_section_renders_without_data`)
 
 ## Tests completed
 
-`pytest` → **56 passed** (was 50 at the end of Phase 4; 6 added this session). Run cold.
+`pytest` → **62 passed** (was 56 at the end of Phase 5; 6 added this session). Run cold.
 
 | File | Covers |
 |---|---|
-| test_model.py (new) | `TabularTokenizer`: ids stay in vocabulary range, `to_dict`/`from_dict` round-trips to identical ids; the adapter trains on the full synthetic dataset (not a tiny subset, so fraud reliably appears in every split), loss decreases, all sanity checks pass, and it genuinely learns (test PR-AUC > 0.3 — this is what caught the `sanity_checks()` side-effect bug); `basic_data_checks` fails on an empty `PreparedLevel`; save/load round-trip gives identical predictions; `evaluate()` reports `None` for AUC (never a fabricated number) on a split with zero positives, which a small subset can genuinely produce given the synthetic fraud's clustered-burst pattern |
-| test_app.py (extended) | headless UI: demo data → Processing → build E1 → Model → train (2 epochs, for speed) → Dashboard, all through the real `app.py` |
+| test_experiment.py (new) | `run_comparison` uses the identical seed and the identical split/sample row counts for every level (the whole point of a controlled comparison); `comparison_table` returns exactly one row per level, in E0/E1/E2 order regardless of the order requested; save/list round-trip preserves the data; an empty `experiments/` directory reports no experiments (never fabricated); **repeated saves are never overwritten** (this is what caught the `next_version` bug) |
+| test_app.py (extended) | headless UI: demo data → Processing → prepare split → Experiments → run comparison (all 3 levels, 2 epochs for speed) → session state has all three `ExperimentResult`s, all through the real `app.py` |
 
-Also verified interactively in a real browser: full synthetic dataset (27,223 rows) → Processing (full subset,
-E2 built) → Model → trained the default config (15 epochs) → 106,177 parameters, 63.76 s on CPU → all sanity
-checks passed → validation PR-AUC 0.97, test PR-AUC 0.83, recall 0.78, precision 0.55, confusion matrix
-TP 18 / FP 15 / FN 5 / TN 4046.
+Also verified interactively in a real browser: prepared a 10,000-row split, ran a 5-epoch comparison of E0/E1/E2
+(train times 2.3 s / 2.5 s / 7.8 s — E2's larger feature/token count costs more per epoch, as expected), saved
+it (`experiments/experiment_v001.json`), then loaded the *same saved file* on the Results page after navigating
+away — confirming persistence actually works across page loads, not just within one render. The demo artifact
+was deleted afterwards; nothing was committed to `experiments/`.
 
 **Not yet executed:** the app on the real 1.3M-row transaction file (only synthetic data was available in the
-build environment, same limitation as Phases 2–4).
+build environment, same limitation as Phases 2–5).
 
 ## Commands used
 
@@ -94,45 +84,44 @@ streamlit run app.py
 
 ## Current git commit
 
-The commit titled "Phase 5: built-in CPU transformer …" (run `git log --oneline -1` for its exact hash; amending
-this file changes the hash, so it is intentionally not pinned here).
+The commit titled "Phase 6: evaluation + experiment runner …" (run `git log --oneline -1` for its exact hash;
+amending this file changes the hash, so it is intentionally not pinned here).
 
 ## Known issues
 
-- Everything carried over from Phases 2–4 still applies.
-- PyTorch does not guarantee bit-exact reproducibility across processes/platforms even with every seed fixed;
-  `torch.set_num_threads(1)` removes the specific multi-threaded-reduction source found here, but section 18's
-  "reproducibility" should be understood as "the same seed reproduces the same result on the same machine," not
-  an absolute cross-platform guarantee — this is a PyTorch characteristic, not something this project can fully
-  close.
-- A small subset (low row count, especially without "full") can land zero positives in validation and/or test,
-  since the synthetic demo data's fraud is a rare, clustered burst per card; `evaluate()` correctly reports
-  `None` for AUC-based metrics rather than fabricating one, but the UI's metrics table just shows "n/a" without
-  explaining why — worth a note in the UI if this comes up often on the real dataset.
-- "Sequence length" (section 12's list of configurable hyperparameters) isn't a separate knob: `TabularTokenizer`
-  gives one token per feature plus a `[CLS]` token, so the sequence length is `1 + len(features)`, fixed by the
-  chosen data level (E0/E1/E2). This fits the tabular representation used here; revisit if a future phase adds a
-  genuinely variable-length sequence representation (e.g. the drafted `previous_transactions` /
-  `format_previous_transactions` in `src/features/behavioral_features.py`, unused so far).
-- The Hugging Face / Nemotron / API backends remain "not yet implemented (Phase 7)" in the Model page, honestly.
-- Training and sanity-checking together on the full dataset with the default 15 epochs takes about 60–90 s on
-  this development machine (single CPU thread, by design — see above); not yet measured on the real 1.3M-row file.
+- Everything carried over from Phases 2–5 still applies (including: a small/short-epoch comparison can make E2
+  look artificially worse than E0/E1 simply because its larger model hasn't converged yet in few epochs — the
+  Experiments page says this directly, but it's easy to miss).
+- `run_comparison` is strictly sequential (one level fully trains before the next starts); fine for CPU/demo
+  scale, would need reconsidering if experiments ever needed to run unattended for a long time or in parallel.
+- No experiment/report currently gets written under `reports/` (only `experiments/`); the master prompt lists
+  both directories in section 4's architecture without a stated distinction — `experiments/` was used for the
+  raw manifest per section 19's "store... in reports/experiments/" wording; revisit if a distinct human-readable
+  report format (e.g. Markdown, matching `cleaner.py`'s `save_cleaning_result` pattern for `data/processed/`) is
+  wanted later.
+- Saved experiments accumulate indefinitely in `experiments/` with no UI to delete one; acceptable for now
+  (matches "never overwritten" — deleting is a deliberate, separate action) but worth a note if it becomes noisy.
 
-## Next task (Phase 6 — evaluation + experiment runner)
+## Next task (Phase 7 — Hugging Face / Nemotron / API adapters)
 
 1. Read this file; run `pytest`.
-2. The Model page already trains and evaluates one level at a time. Phase 6's job is the *comparison*: run E0,
-   E1 and E2 with **identical model settings, seed and split** (section 17) and report PR-AUC/ROC-AUC/precision/
-   recall/F1/training time/device for each, side by side — this is what the "Experiments" placeholder page
-   promises. `src/evaluation/metrics.py`'s `evaluate(pred, threshold)` free function (with `_slice_unseen_entity`
-   support) was moved in Phase 5 but is still unused — check whether it fits this job before writing something new.
-3. Persist experiment results (section 19: `experiments/`, `reports/` directories already exist, empty) so a
-   comparison isn't lost on rerun; decide a simple, honest format (e.g. one JSON per experiment run) — do not
-   over-engineer an experiment-tracking system beyond what's asked.
-4. Results page: comparison table/chart of E0 vs E1 vs E2's *measured* metrics only (section 27: no fabrication;
-   if a level wasn't run, say so, don't fill in a guess).
-5. Keep using `DataPreparer.build(level)`'s cache (already built E0/E1/E2 share the same split) rather than
-   re-preparing data per experiment.
+2. Inspect `_pending/src/models/hf_adapter.py`, `api_adapter.py`, `registry.py` (**unverified drafts**) and
+   `_pending/src/models/hf_backend.py` (research notebooks, Nemotron LoRA on a T4 — tested there, but on a GPU;
+   verify what changes for CPU-only or no-GPU environments) against the current `ModelAdapter` interface
+   (`src/models/base.py`) the same way Phase 5 reconciled `sanity_transformer.py` — check these drafts'
+   constructor signature and method set match, don't assume.
+3. Section 13's explicit guidance: Hugging Face support "can be implemented through an adapter" (weaker
+   requirement than the built-in Transformer); Nemotron "should only be connected after verifying a suitable
+   checkpoint/configuration" and "do NOT invent a model checkpoint" — do not fabricate a working Nemotron
+   integration if no verified checkpoint/config is available in this environment; it is fine for `availability()`
+   to honestly report it unavailable (section 14: CPU-only machines should be told fine-tuning large models
+   isn't practical there, matching `recommendations()` in `src/utils/hardware.py`).
+4. `PLANNED_BACKENDS` in `src/models/base.py` already has the right shape (`key`/`label`/`description`/`phase`/
+   `implemented`) for the Model page's backend table; update entries as adapters actually become usable rather
+   than marking `implemented: true` prematurely.
+5. Whatever backend(s) end up implemented should plug into the *existing* `run_experiment`/`run_comparison`
+   (Phase 6) and the Model page without those needing backend-specific changes — that's the point of the shared
+   `ModelAdapter` interface; if a backend can't fit it, that's a design problem to flag, not route around.
 
 ## TODO by phase
 
@@ -141,7 +130,7 @@ this file changes the hash, so it is intentionally not pinned here).
 - [x] Phase 3: E0 / E1 / E2 pipelines, subsets, temporal split
 - [x] Phase 4: feature engineering + leakage checks
 - [x] Phase 5: built-in CPU transformer
-- [ ] Phase 6: evaluation + experiment runner
+- [x] Phase 6: evaluation + experiment runner
 - [ ] Phase 7: Hugging Face / Nemotron / API adapters
 - [ ] Phase 8: polish, documentation, tests, Colab notebook
 - [ ] Later: generalization test on a non-fraud dataset

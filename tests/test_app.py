@@ -18,8 +18,8 @@ def test_every_section_renders_without_data():
     for page in ["Dashboard", "Data Upload", "Profiling", "Quality Analysis", "Processing", "Model", "Experiments", "Results"]:
         at.sidebar.radio[0].set_value(page).run()
         _no_errors(at)
-    at.sidebar.radio[0].set_value("Experiments").run()
-    assert any("Not run" in str(df.value) for df in at.dataframe)
+    at.sidebar.radio[0].set_value("Results").run()
+    assert any("No saved experiments" in str(i.value) for i in at.info)
 
 
 def test_demo_flow_upload_schema_profile():
@@ -86,6 +86,28 @@ def test_demo_flow_model_training():
     assert 0.0 <= trained["results"]["threshold_from_validation"] <= 1.0
 
     at.sidebar.radio[0].set_value("Dashboard").run()
+    _no_errors(at)
+
+
+def test_demo_flow_experiments():
+    at = streamlit_testing.AppTest.from_file(APP, default_timeout=240).run()
+    at.sidebar.radio[0].set_value("Data Upload").run()
+    at.button(key="load_demo").click().run()
+    at.sidebar.radio[0].set_value("Processing").run()
+    at.button(key="prepare_split").click().run()
+    _no_errors(at)
+
+    at.sidebar.radio[0].set_value("Experiments").run()
+    _no_errors(at)
+    at.number_input[0].set_value(2).run()          # epochs: keep the headless run fast
+    at.button(key="run_experiment").click().run()
+    _no_errors(at)
+
+    results = at.session_state["experiment"]
+    assert results is not None and {r.level for r in results} == {"E0", "E1", "E2"}
+    assert all(r.epochs_run <= 2 for r in results)
+
+    at.sidebar.radio[0].set_value("Results").run()      # not run+saved here: covered by test_experiment.py with tmp_path
     _no_errors(at)
 
 

@@ -14,6 +14,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+from src.evaluation.experiment import ExperimentResult, comparison_table, list_experiments, run_comparison, save_experiment
 from src.ingestion.loader import DatasetIntegrityError, UnsupportedFormatError, load_dataset
 from src.ingestion.roles import (ROLE_LABELS, TASK_LABELS, TASKS, detect_roles, entity_summary, leakage_indicators,
                                  schema_for_profiling, target_summary, time_summary)
@@ -32,7 +33,6 @@ logging.basicConfig(level=logging.WARNING)
 st.set_page_config(page_title="Transaction Data Intelligence", layout="wide")
 
 PAGES = ["Dashboard", "Data Upload", "Profiling", "Quality Analysis", "Processing", "Model", "Experiments", "Results"]
-PHASE_OF_PAGE = {"Model": 5, "Experiments": 6, "Results": 6}
 
 CSS = """
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
@@ -65,7 +65,7 @@ h2, h3 { font-weight: 600; letter-spacing: -0.005em; }
 def init_state():
     defaults = {"nav": "Dashboard", "df": None, "meta": None, "schema": None, "roles": None, "profile": None,
                 "profile_info": None, "source": None, "error": None, "quality": None, "preprocessing": None,
-                "preparer": None, "levels": None, "model": None}
+                "preparer": None, "levels": None, "model": None, "experiment": None}
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
 
@@ -104,7 +104,8 @@ def set_dataset(path: Path, source: str):
         roles = roles.with_overrides(ds.df, entity=overrides.get("entity_column"), datetime=overrides.get("datetime_column"),
                                      task=hints.get("task"))
     st.session_state.update(df=ds.df, meta=ds.metadata, schema=schema, roles=roles, profile=None, profile_info=None,
-                            quality=None, preprocessing=None, preparer=None, levels=None, model=None, source=source, error=None,
+                            quality=None, preprocessing=None, preparer=None, levels=None, model=None, experiment=None,
+                            source=source, error=None,
                             load_seconds=round(time.time() - t0, 1))
 
 
@@ -131,6 +132,7 @@ def sidebar():
         df, roles = st.session_state.df, st.session_state.roles
         prof, qual, prep = st.session_state.profile, st.session_state.quality, st.session_state.preprocessing
         levels, model = st.session_state.levels, st.session_state.model
+        experiment = st.session_state.experiment
         steps = [("Load data", "done" if df is not None else "ready"),
                  ("Confirm schema and task", "done" if roles is not None and roles.target else ("ready" if df is not None else "wait")),
                  ("Profile", "done" if prof is not None else ("ready" if df is not None else "wait")),
@@ -138,9 +140,9 @@ def sidebar():
                  ("Basic preprocessing", "done" if prep is not None else ("ready" if df is not None else "wait")),
                  ("Process E0 / E1 / E2", "done" if levels else ("ready" if df is not None else "wait")),
                  ("Train and evaluate", "done" if model else ("ready" if levels else "wait")),
-                 ("Compare experiments", "wait")]
+                 ("Compare experiments", "done" if experiment else ("ready" if levels else "wait"))]
         html = "".join(f'<div class="tdi-step tdi-{state}"><span class="n">{i}</span><span>{name}'
-                       f'{" <small>(later phase)</small>" if state == "wait" and i > 7 else ""}</span></div>'
+                       f'{" <small>(later phase)</small>" if state == "wait" and i > 8 else ""}</span></div>'
                        for i, (name, state) in enumerate(steps, start=1))
         st.markdown(html, unsafe_allow_html=True)
         st.divider()
@@ -184,7 +186,8 @@ def page_dashboard():
               ("E0 / E1 / E2 processing", 3, "done" if st.session_state.levels else ("ready" if df is not None else "wait")),
               ("Feature engineering and leakage checks", 4, "done" if st.session_state.levels else ("ready" if df is not None else "wait")),
               ("Built-in transformer", 5, "done" if st.session_state.model else ("ready" if st.session_state.levels else "wait")),
-              ("Evaluation and experiments", 6, "planned"), ("Hugging Face / Nemotron / API adapters", 7, "planned")]
+              ("Evaluation and experiments", 6, "done" if st.session_state.experiment else ("ready" if st.session_state.levels else "wait")),
+              ("Hugging Face / Nemotron / API adapters", 7, "planned")]
     st.dataframe(pd.DataFrame([{"Stage": s, "Phase": p, "Status": {"done": "Done", "ready": "Ready to run",
                                                                    "wait": "Load data first",
                                                                    "planned": "Not yet implemented"}[k]} for s, p, k in status]),
@@ -286,7 +289,8 @@ def schema_editor():
                 new = new.with_overrides(df, task=task_override)
             st.session_state.roles, st.session_state.profile = new, None
             st.session_state.quality, st.session_state.preprocessing = None, None
-            st.session_state.preparer, st.session_state.levels, st.session_state.model = None, None, None
+            st.session_state.preparer, st.session_state.levels = None, None
+            st.session_state.model, st.session_state.experiment = None, None
             st.success("Schema updated. Profile again to use the changes.")
             st.rerun()
         except ValueError as e:
@@ -516,22 +520,6 @@ def render_preprocessing(result):
         st.dataframe(result.cleaning.df[preview_cols].head(20), width="stretch")
 
 
-def page_placeholder(name: str):
-    st.title(name)
-    phase = PHASE_OF_PAGE[name]
-    descriptions = {
-        "Experiments": "Run E0, E1 and E2 with identical model settings, seed and split.",
-        "Results": "Comparison tables and charts of measured metrics.",
-    }
-    st.info(f"Not yet implemented: planned for Phase {phase}.")
-    if name in descriptions:
-        st.markdown(descriptions[name])
-    if name in ("Experiments", "Results"):
-        st.dataframe(pd.DataFrame([{"Experiment": e, "Status": "Not run"} for e in ["E0 Raw", "E1 Quality processed",
-                                                                                     "E2 Feature engineered"]]),
-                     hide_index=True)
-
-
 def page_processing():
     st.title("Processing")
     df, schema, roles = st.session_state.df, st.session_state.schema, st.session_state.roles
@@ -740,6 +728,80 @@ def render_model_results(trained: dict):
               f"FN {cm['fn']:.1f} · TN {cm['tn']:.1f}")
 
 
+def page_experiments():
+    st.title("Experiments")
+    st.markdown('<p class="tdi-lead">Train the same model, with the same settings and the same split and sample, '
+               "on E0, E1 and E2, so any difference in results comes from the data preparation, not the training "
+               "setup.</p>", unsafe_allow_html=True)
+    preparer = st.session_state.preparer
+    if preparer is None:
+        st.info("Prepare a split on the Processing page first.")
+        return
+
+    cfg = config()
+    mcfg = cfg["models"]["sanity_transformer"]
+    hw = hardware()
+    levels_to_run = st.multiselect("Levels to compare", ["E0", "E1", "E2"], default=["E0", "E1", "E2"])
+    c = st.columns(3)
+    epochs = c[0].number_input("Epochs", min_value=1, max_value=200, value=int(mcfg["epochs"]), key="exp_epochs")
+    batch_options = [64, 128, 256, 512, 1024]
+    batch_size = c[1].selectbox("Batch size", batch_options,
+                                index=batch_options.index(mcfg["batch_size"]) if mcfg["batch_size"] in batch_options else 2,
+                                key="exp_batch")
+    patience = c[2].number_input("Patience", min_value=1, max_value=20, value=int(mcfg["patience"]), key="exp_patience")
+    st.caption("A fair comparison needs enough epochs for the larger E2 model to converge too: if E2 looks worse "
+              "than E0 / E1 with very few epochs, that alone doesn't mean feature engineering hurt — try more epochs.")
+
+    if st.button("Run comparison", type="primary", key="run_experiment", disabled=not levels_to_run):
+        settings = {"epochs": int(epochs), "batch_size": int(batch_size), "patience": int(patience)}
+        status = st.empty()
+        def _progress(i, n, r):
+            status.info(f"{r.level} done ({i}/{n}): test PR-AUC {_fmt_metric(r.metrics['test']['pr_auc'])}, "
+                       f"{r.train_seconds} s")
+        with st.spinner(f"Running {len(levels_to_run)} experiment(s)…"):
+            results = run_comparison(preparer, levels_to_run, cfg, settings, device=hw["device"], progress=_progress)
+        status.empty()
+        st.session_state.experiment = results
+
+    results = st.session_state.experiment
+    if not results:
+        st.info("Not run yet.")
+        return
+    render_experiment(results)
+    if st.button("Save this comparison to experiments/", key="save_experiment"):
+        meta = st.session_state.meta
+        path = save_experiment(results, ROOT, meta.dataset_id if meta else "unknown", preparer.split_info)
+        st.success(f"Saved to {path.relative_to(ROOT)}")
+
+
+def render_experiment(results: list):
+    st.subheader("Comparison")
+    st.dataframe(comparison_table(results), hide_index=True, width="stretch")
+    chart = pd.DataFrame({r.level: {"Test PR-AUC": r.metrics["test"]["pr_auc"] or 0.0,
+                                    "Test F1": r.metrics["test"]["f1"]} for r in results}).T
+    st.bar_chart(chart)
+    st.caption("A level whose test split had zero positives shows 0 here for PR-AUC (reported as 'n/a', not a "
+              "real zero, in the table above) rather than being left out of the chart.")
+
+
+def page_results():
+    st.title("Results")
+    st.markdown('<p class="tdi-lead">Comparison tables and charts of measured metrics from saved experiments. '
+               "Nothing here is estimated or fabricated: an experiment that hasn't been run and saved simply "
+               "doesn't appear.</p>", unsafe_allow_html=True)
+    experiments = list_experiments(ROOT)
+    if not experiments:
+        st.info("No saved experiments yet. Run a comparison on the Experiments page, then save it.")
+        return
+    labels = [f"{e['experiment']} · {e['created_at']} · {e['dataset_id']} · "
+             f"{'/'.join(r['level'] for r in e['results'])}" for e in experiments]
+    idx = st.selectbox("Saved experiment", range(len(experiments)), format_func=lambda i: labels[i])
+    exp = experiments[idx]
+    results = [ExperimentResult.from_dict(r) for r in exp["results"]]
+    st.caption(f"Dataset `{exp['dataset_id']}` · split method: {exp['split']['boundaries']['method']}")
+    render_experiment(results)
+
+
 # ------------------------------------------------------------------ main
 def main():
     init_state()
@@ -759,8 +821,10 @@ def main():
             page_processing()
         elif page == "Model":
             page_model()
-        else:
-            page_placeholder(page)
+        elif page == "Experiments":
+            page_experiments()
+        elif page == "Results":
+            page_results()
     except Exception as e:                                         # show errors clearly instead of a blank page
         st.error(f"Something went wrong on this page: {type(e).__name__}: {e}")
         st.exception(e)
