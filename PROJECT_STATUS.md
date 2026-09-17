@@ -74,6 +74,37 @@ Four commits, one per fix, each with the full suite run cold before committing:
 `87d3547` (findings 1+5), `54d6cfe` (finding 4), `548b34e` (multi-seed harness). Run `git log --oneline` for
 the exact current head.
 
+## Measured, not just implemented: what the audit fixes actually did (this session, after the fixes above)
+
+Per the brief's own instruction not to claim a change is beneficial without running the experiment, I used the
+new multi-seed harness (3 seeds, synthetic demo data, `rows=6000` so oversampling actually triggers — `rows=
+"full"` barely oversamples on this synthetic generator and would not have exercised finding 4 at all) to check
+findings 4 and 5 empirically rather than leaving them as assumed improvements. **One of them failed this check
+and was reverted; this is exactly the kind of result the audit exists to catch, not a problem to hide:**
+
+- **Finding 4 fix (`class_weighting: sample_weight`) measurably regressed performance and was reverted.**
+  Isolated on E0 alone (no sequence features involved, so nothing else could explain it):
+  PR-AUC 0.470±0.287 (`none`) vs 0.144±0.179 (`sample_weight`) — a large, consistent drop, confirmed the same
+  direction on E1 and E2 too. Diagnosis: at ~0.4% true prevalence, reweighting the loss back toward the true
+  rate makes the rare class's gradient contribution negligible relative to the abundant majority class,
+  undermining exactly what oversampling exists to provide. The original diagnosis (`_weight` computed but
+  never used in training — a real train/eval mismatch) still stands; this specific fix for it doesn't survive
+  contact with severe imbalance. Default reverted to `none`; `sample_weight` kept available, not recommended.
+  Full numbers and diagnosis are in the "Revert class_weighting default…" commit message.
+- **Finding 5 (sequence features in E2) is not yet a clear win on synthetic data, but looks stabilizing.**
+  With `class_weighting=none` isolating just this change: PR-AUC 0.858±0.124 (off) vs 0.806±0.012 (on) — the
+  means are within each other's noise band (3 seeds is not enough to call this either way), but sequence
+  features cut seed-to-seed variance roughly 10×. Left enabled by default on that basis (more reliable, not
+  measurably worse), but **this is a much weaker claim than "the single largest effect measured in [the
+  separate Nemotron] research" quoted earlier in this file** — that result was on a fine-tuned 4B language
+  model reading real transaction sequences as text, not this small from-scratch tabular transformer on
+  synthetic data; the two are not directly comparable and this session's measurement should not be read as
+  confirming that other result transfers here.
+
+**Takeaway for anyone continuing this project: measure before defaulting, the same discipline that caught
+finding 4's regression should be applied to every future config-default change, including the ones already
+made (finding 5's default is a judgement call on weak evidence, not a settled result).**
+
 ## Original phase history
 
 ## Cumulative summary (all phases)
@@ -154,9 +185,11 @@ python -c "import nbformat; from nbclient import NotebookClient; ..."  # execute
 
 ## Current git commit
 
-The commit titled "Audit fix 4/4: multi-seed comparison harness …" (run `git log --oneline -1` for its exact
-hash; amending this file changes the hash, so it is intentionally not pinned here). Three earlier commits in
-the same session: "Audit fixes 1/2: …" (findings 1+5), "Audit fix 3/4: …" (finding 4), each with the full
+The commit titled "Update PROJECT_STATUS.md: document the measured class_weighting revert …" (run
+`git log --oneline -1` for its exact hash; amending this file changes the hash, so it is intentionally not
+pinned here). Five commits this session in order: "Audit fixes 1/2: …" (findings 1+5), "Audit fix 3/4: …"
+(finding 4), "Audit fix 4/4: …" (multi-seed harness), "Update PROJECT_STATUS.md: document audit findings…",
+"Revert class_weighting default to 'none': measured regression, not assumed benefit" — each with the full
 suite run cold before committing.
 
 ## Known issues
@@ -207,9 +240,13 @@ audit recommended:
 5. Add `class_weighting: pos_weight_natural` (§12's Experiment 4: natural sampling + `pos_weight`, as opposed
    to this session's oversampling + sample-weight fix) as a second, directly comparable option, if L1 vs L2
    turns out to matter empirically once run.
-6. Once 1–5 land: re-run `run_comparison_multiseed` on E0/E1/E2 with 3 seeds and actually report the
-   before/after numbers — nothing in this session claims a performance change, only that specific,
-   verified bugs were fixed; whether they move PR-AUC is still an open, unmeasured question.
+6. **Partially done this session** for findings 4 and 5 specifically (see "Measured, not just implemented"
+   above) — finding 4's fix was measured to regress performance and reverted; finding 5 is measured but
+   inconclusive (3 seeds, small synthetic data). Finding 1 was not A/B tested via the harness (its fix isn't
+   config-reversible — the redundant columns were removed from the code, not toggled), but was proven
+   lossless analytically (100% exact token match, see the original audit). Once items 1–5 above land, extend
+   this same measure-before-trusting discipline to them, and re-run the full E0/E1/E2 comparison, not just
+   the isolated finding-4/5 checks done so far.
 7. **Run it on the real dataset** — still never done, unchanged from before this session.
 8. **Generalization test on a non-fraud dataset**, through the *full app*, not just the `churn` fixture unit
    tests that already exist.
