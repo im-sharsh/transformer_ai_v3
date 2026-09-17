@@ -111,6 +111,27 @@ def test_demo_flow_experiments():
     _no_errors(at)
 
 
+def test_demo_flow_experiments_multiseed():
+    """Exercises the multi-seed branch of the Experiments page end to end (not just the library function)."""
+    at = streamlit_testing.AppTest.from_file(APP, default_timeout=300).run()
+    at.sidebar.radio[0].set_value("Data Upload").run()
+    at.button(key="load_demo").click().run()
+    at.sidebar.radio[0].set_value("Processing").run()
+    at.button(key="prepare_split").click().run()
+    _no_errors(at)
+
+    at.sidebar.radio[0].set_value("Experiments").run()
+    at.number_input[0].set_value(2).run()
+    at.multiselect(key="exp_seeds").set_value([42, 123]).run()
+    at.button(key="run_experiment").click().run()
+    _no_errors(at)
+
+    results = at.session_state["experiment"]
+    assert isinstance(results, dict) and set(results) == {42, 123}
+    for seed, rs in results.items():
+        assert {r.seed for r in rs} == {seed} and {r.level for r in rs} == {"E0", "E1", "E2"}
+
+
 def test_demo_flow_quality_and_basic_preprocessing():
     at = streamlit_testing.AppTest.from_file(APP, default_timeout=180).run()
     at.sidebar.radio[0].set_value("Data Upload").run()

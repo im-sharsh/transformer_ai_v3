@@ -14,7 +14,8 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from src.evaluation.experiment import ExperimentResult, comparison_table, list_experiments, run_comparison, save_experiment
+from src.evaluation.experiment import (ExperimentResult, aggregate_seeds, comparison_table, list_experiments,
+                                       run_comparison, run_comparison_multiseed, save_experiment)
 from src.ingestion.loader import DatasetIntegrityError, UnsupportedFormatError, load_dataset
 from src.ingestion.roles import (ROLE_LABELS, TASK_LABELS, TASKS, detect_roles, entity_summary, leakage_indicators,
                                  schema_for_profiling, target_summary, time_summary)
@@ -776,37 +777,69 @@ def page_experiments():
     patience = c[2].number_input("Patience", min_value=1, max_value=20, value=int(mcfg["patience"]), key="exp_patience")
     st.caption("A fair comparison needs enough epochs for the larger E2 model to converge too: if E2 looks worse "
               "than E0 / E1 with very few epochs, that alone doesn't mean feature engineering hurt — try more epochs.")
+    seed_options = [42, 123, 456]
+    seeds = st.multiselect("Seeds (pick more than one to get a mean ± std rather than a single run)", seed_options,
+                          default=[mcfg["seed"]] if mcfg["seed"] in seed_options else [42], key="exp_seeds")
+    if len(seeds) > 1:
+        st.caption(f"Everything (split, sample, model settings) stays fixed across these {len(seeds)} runs per "
+                  "level — only the random seed changes. A single seed can look better or worse than another "
+                  "purely by chance; don't trust one run's ranking of E0/E1/E2 without this.")
 
-    if st.button("Run comparison", type="primary", key="run_experiment", disabled=not levels_to_run):
+    if st.button("Run comparison", type="primary", key="run_experiment", disabled=not levels_to_run or not seeds):
         settings = {"epochs": int(epochs), "batch_size": int(batch_size), "patience": int(patience)}
         status = st.empty()
-        def _progress(i, n, r):
-            status.info(f"{r.level} done ({i}/{n}): test PR-AUC {_fmt_metric(r.metrics['test']['pr_auc'])}, "
-                       f"{r.train_seconds} s")
-        with st.spinner(f"Running {len(levels_to_run)} experiment(s)…"):
-            results = run_comparison(preparer, levels_to_run, cfg, settings, device=hw["device"], progress=_progress)
+        if len(seeds) == 1:
+            def _progress(i, n, r):
+                status.info(f"{r.level} done ({i}/{n}): test PR-AUC {_fmt_metric(r.metrics['test']['pr_auc'])}, "
+                           f"{r.train_seconds} s")
+            with st.spinner(f"Running {len(levels_to_run)} experiment(s)…"):
+                results = run_comparison(preparer, levels_to_run, cfg, {**settings, "seed": seeds[0]},
+                                         device=hw["device"], progress=_progress)
+            st.session_state.experiment = results
+        else:
+            def _progress(done, total, seed, r):
+                status.info(f"seed {seed}, {r.level} done ({done}/{total} total runs): "
+                           f"test PR-AUC {_fmt_metric(r.metrics['test']['pr_auc'])}, {r.train_seconds} s")
+            with st.spinner(f"Running {len(levels_to_run)} level(s) × {len(seeds)} seed(s)…"):
+                by_seed = run_comparison_multiseed(preparer, levels_to_run, cfg, seeds, settings,
+                                                   device=hw["device"], progress=_progress)
+            st.session_state.experiment = by_seed
         status.empty()
-        st.session_state.experiment = results
 
     results = st.session_state.experiment
     if not results:
         st.info("Not run yet.")
         return
     render_experiment(results)
+    flat = results if isinstance(results, list) else [r for rs in results.values() for r in rs]
     if st.button("Save this comparison to experiments/", key="save_experiment"):
         meta = st.session_state.meta
-        path = save_experiment(results, ROOT, meta.dataset_id if meta else "unknown", preparer.split_info)
-        st.success(f"Saved to {path.relative_to(ROOT)}")
+        path = save_experiment(flat, ROOT, meta.dataset_id if meta else "unknown", preparer.split_info)
+        st.success(f"Saved to {path.relative_to(ROOT)} ({len(flat)} run(s): "
+                  f"{len(results) if not isinstance(results, list) else 1} seed(s))")
 
 
-def render_experiment(results: list):
-    st.subheader("Comparison")
-    st.dataframe(comparison_table(results), hide_index=True, width="stretch")
-    chart = pd.DataFrame({r.level: {"Test PR-AUC": r.metrics["test"]["pr_auc"] or 0.0,
-                                    "Test F1": r.metrics["test"]["f1"]} for r in results}).T
+def render_experiment(results):
+    if isinstance(results, list):                 # single seed: unchanged from before this feature was added
+        st.subheader("Comparison")
+        st.dataframe(comparison_table(results), hide_index=True, width="stretch")
+        chart = pd.DataFrame({r.level: {"Test PR-AUC": r.metrics["test"]["pr_auc"] or 0.0,
+                                        "Test F1": r.metrics["test"]["f1"]} for r in results}).T
+        st.bar_chart(chart)
+        st.caption("A level whose test split had zero positives shows 0 here for PR-AUC (reported as 'n/a', not a "
+                  "real zero, in the table above) rather than being left out of the chart.")
+        return
+    st.subheader(f"Comparison — mean ± std across {len(results)} seeds")
+    table = aggregate_seeds(results)
+    st.dataframe(table.reset_index().rename(columns={"index": "Level"}), hide_index=True, width="stretch")
+    chart = table[["pr_auc mean", "f1 mean"]].rename(columns={"pr_auc mean": "Test PR-AUC", "f1 mean": "Test F1"})
     st.bar_chart(chart)
-    st.caption("A level whose test split had zero positives shows 0 here for PR-AUC (reported as 'n/a', not a "
-              "real zero, in the table above) rather than being left out of the chart.")
+    st.caption("Error bars aren't drawn on the chart above; read the std columns in the table for spread. "
+              "A metric of 'n/a' for a whole level here would mean every seed's test split had zero positives.")
+    with st.expander("Per-seed detail"):
+        for seed, rs in results.items():
+            st.markdown(f"**Seed {seed}**")
+            st.dataframe(comparison_table(rs), hide_index=True, width="stretch")
 
 
 def page_results():

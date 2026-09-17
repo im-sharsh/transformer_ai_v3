@@ -73,6 +73,47 @@ def run_comparison(preparer: DataPreparer, levels: list, config: dict, settings:
     return out
 
 
+def run_comparison_multiseed(preparer: DataPreparer, levels: list, config: dict, seeds: list, settings: dict | None = None,
+                             device: str | None = None, progress=None) -> dict:
+    """Repeats run_comparison once per seed (same split/sample/settings throughout — only the seed changes),
+    so E0/E1/E2 can be reported as mean ± std rather than trusted from a single run (see the project brief's
+    own §16 requirement, not previously implemented: run_comparison always used exactly one seed).
+    Returns {seed: [ExperimentResult, ...]}. Levels already built on `preparer` are reused across seeds
+    (DataPreparer caches by level), so only training + evaluation repeat per seed, not data preparation."""
+    out = {}
+    total = len(seeds) * len(levels)
+    done = 0
+    for seed in seeds:
+        per_seed_settings = {**(settings or {}), "seed": int(seed)}
+
+        def _progress(i, n, r, seed=seed):
+            nonlocal done
+            done += 1
+            if progress:
+                progress(done, total, seed, r)
+        out[seed] = run_comparison(preparer, levels, config, per_seed_settings, device, _progress if progress else None)
+    return out
+
+
+def aggregate_seeds(results_by_seed: dict) -> pd.DataFrame:
+    """Mean +/- std of the test-set metrics across seeds, one row per level, in E0/E1/E2 order.
+    Never fabricates a std for a single seed (reports it as 0.0 explicitly rather than NaN-hiding it)."""
+    metric_keys = ["pr_auc", "roc_auc", "precision", "recall", "f1"]
+    rows = []
+    for seed, results in results_by_seed.items():
+        for r in results:
+            m = r.metrics["test"]
+            rows.append({"seed": seed, "Level": r.level, **{k: m[k] for k in metric_keys}})
+    long = pd.DataFrame(rows)
+    n_seeds = long.groupby("Level")["seed"].nunique()
+    agg = long.groupby("Level")[metric_keys].agg(["mean", "std"])
+    agg.columns = [f"{k} {stat}" for k, stat in agg.columns]
+    for k in metric_keys:
+        agg[f"{k} std"] = agg[f"{k} std"].fillna(0.0)
+    agg.insert(0, "Seeds", n_seeds)
+    return agg.reindex(sorted(agg.index, key=lambda l: LEVEL_ORDER.index(l)))
+
+
 def comparison_table(results: list) -> pd.DataFrame:
     rows = []
     for r in results:
