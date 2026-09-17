@@ -40,6 +40,30 @@ def test_demo_flow_upload_schema_profile():
     assert any(m.label == "Target" and m.value == "is_fraud" for m in at.metric)
 
 
+def test_demo_flow_processing():
+    at = streamlit_testing.AppTest.from_file(APP, default_timeout=180).run()
+    at.sidebar.radio[0].set_value("Data Upload").run()
+    at.button(key="load_demo").click().run()
+    at.sidebar.radio[0].set_value("Processing").run()
+    _no_errors(at)
+
+    at.button(key="prepare_split").click().run()
+    _no_errors(at)
+    preparer = at.session_state["preparer"]
+    assert preparer is not None and preparer.split_info
+
+    for level in ["E0", "E1", "E2"]:
+        at.button(key=f"build_{level}").click().run()
+        _no_errors(at)
+    levels = at.session_state["levels"]
+    assert set(levels) == {"E0", "E1", "E2"}
+    assert levels["E0"].features and levels["E1"].features and levels["E2"].features
+    assert levels["E2"].info["point_in_time"]["passed"]
+
+    at.sidebar.radio[0].set_value("Dashboard").run()
+    _no_errors(at)
+
+
 def test_demo_flow_quality_and_basic_preprocessing():
     at = streamlit_testing.AppTest.from_file(APP, default_timeout=180).run()
     at.sidebar.radio[0].set_value("Data Upload").run()

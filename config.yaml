@@ -11,8 +11,11 @@ project:
 data:
   target: null            # e.g. is_fraud, churn
   task: null              # binary_classification | multiclass_classification | regression; null = detect
-  entity_column: null     # e.g. cc_num, customer_id (used later for history features)
-  datetime_column: null   # event time (used later for temporal splits and features)
+  entity_column: null     # e.g. cc_num, customer_id (used for history features)
+  datetime_column: null   # event time (used for temporal splits and features)
+  amount_column: null     # e.g. amt (used for E2 history/velocity features); null = detect from column names
+  category_column: null   # e.g. category
+  merchant_column: null   # e.g. merchant
 
 upload:
   save_uploads_to: data/raw   # uploaded files are stored here unchanged
@@ -46,10 +49,24 @@ preprocessing:                 # basic preprocessing (Phase 2): stateless, safe 
   quarantine_missing_mandatory: true
   duplicate_policy: remove           # remove | quarantine | retain
 
-subsets:                  # later phase (Processing)
+subsets:                   # Phase 3 (Processing): reproducible subset sizes offered in the UI
   options: [10000, 50000, 100000, 200000, 500000, full]
-  cpu_default: 20000
+  cpu_default: 10000
 
-split:                    # later phase
-  method: temporal        # temporal when a datetime column exists, otherwise random
+split:                     # Phase 3: train/validation/test assignment, shared by every level
+  method: temporal         # temporal when a datetime column exists, otherwise falls back to random
   fractions: [0.70, 0.15, 0.15]
+
+sampling:                  # Phase 3: fixed experiment sample per split, drawn once and reused by every level
+  train_positive_share: 0.10     # oversample the positive class in train/validation so small subsets still see it
+  validation_positive_share: 0.10
+  keep_all_test_positives: true  # test keeps every positive it can (up to max_test_positive_share) for reliable metrics
+  max_test_positive_share: 0.5
+
+processing:                # Phase 3: E1 / E2 train-fitted transforms (missing values, rare categories, numeric)
+  rare_min_frequency: 0.001      # categories below this training-set frequency are grouped as rare
+  n_bins: 10                     # decile bins for numeric transforms
+  log_skew_threshold: 2.0        # log1p applied when training-set skewness exceeds this and the column is non-negative
+
+features:                  # Phase 3 (E2 history features); gracefully skipped if entity/time/amount are unavailable
+  windows: ["1h", "24h", "7d", "30d"]

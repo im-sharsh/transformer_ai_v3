@@ -21,6 +21,7 @@ from src.ingestion.schema_detector import detect_schema
 from src.models.base import PLANNED_BACKENDS
 from src.preprocessing.basic_preprocessing import run_basic_preprocessing
 from src.preprocessing.cleaner import CleaningConfig
+from src.preprocessing.levels import DataPreparer, infer_roles
 from src.profiling.profiler import profile_dataset
 from src.quality.quality_engine import assess_quality
 from src.utils.config import ROOT, load_config
@@ -30,7 +31,7 @@ logging.basicConfig(level=logging.WARNING)
 st.set_page_config(page_title="Transaction Data Intelligence", layout="wide")
 
 PAGES = ["Dashboard", "Data Upload", "Profiling", "Quality Analysis", "Processing", "Model", "Experiments", "Results"]
-PHASE_OF_PAGE = {"Processing": 3, "Model": 5, "Experiments": 6, "Results": 6}
+PHASE_OF_PAGE = {"Model": 5, "Experiments": 6, "Results": 6}
 
 CSS = """
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
@@ -62,7 +63,8 @@ h2, h3 { font-weight: 600; letter-spacing: -0.005em; }
 # ------------------------------------------------------------------ state and cached work
 def init_state():
     defaults = {"nav": "Dashboard", "df": None, "meta": None, "schema": None, "roles": None, "profile": None,
-                "profile_info": None, "source": None, "error": None, "quality": None, "preprocessing": None}
+                "profile_info": None, "source": None, "error": None, "quality": None, "preprocessing": None,
+                "preparer": None, "levels": None}
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
 
@@ -97,7 +99,7 @@ def set_dataset(path: Path, source: str):
         roles = roles.with_overrides(ds.df, entity=overrides.get("entity_column"), datetime=overrides.get("datetime_column"),
                                      task=hints.get("task"))
     st.session_state.update(df=ds.df, meta=ds.metadata, schema=schema, roles=roles, profile=None, profile_info=None,
-                            quality=None, preprocessing=None, source=source, error=None,
+                            quality=None, preprocessing=None, preparer=None, levels=None, source=source, error=None,
                             load_seconds=round(time.time() - t0, 1))
 
 
@@ -123,12 +125,14 @@ def sidebar():
         st.markdown("**Pipeline**")
         df, roles = st.session_state.df, st.session_state.roles
         prof, qual, prep = st.session_state.profile, st.session_state.quality, st.session_state.preprocessing
+        levels = st.session_state.levels
         steps = [("Load data", "done" if df is not None else "ready"),
                  ("Confirm schema and task", "done" if roles is not None and roles.target else ("ready" if df is not None else "wait")),
                  ("Profile", "done" if prof is not None else ("ready" if df is not None else "wait")),
                  ("Quality analysis", "done" if qual is not None else ("ready" if df is not None else "wait")),
                  ("Basic preprocessing", "done" if prep is not None else ("ready" if df is not None else "wait")),
-                 ("Process E0 / E1 / E2", "wait"), ("Train and evaluate", "wait"), ("Compare experiments", "wait")]
+                 ("Process E0 / E1 / E2", "done" if levels else ("ready" if df is not None else "wait")),
+                 ("Train and evaluate", "wait"), ("Compare experiments", "wait")]
         html = "".join(f'<div class="tdi-step tdi-{state}"><span class="n">{i}</span><span>{name}'
                        f'{" <small>(later phase)</small>" if state == "wait" and i > 5 else ""}</span></div>'
                        for i, (name, state) in enumerate(steps, start=1))
@@ -173,7 +177,7 @@ def page_dashboard():
               ("Profiling", 1, "done" if st.session_state.profile is not None else "ready"),
               ("Quality analysis", 2, "done" if st.session_state.quality is not None else ("ready" if df is not None else "wait")),
               ("Basic preprocessing", 2, "done" if st.session_state.preprocessing is not None else ("ready" if df is not None else "wait")),
-              ("E0 / E1 / E2 processing", 3, "planned"),
+              ("E0 / E1 / E2 processing", 3, "done" if st.session_state.levels else ("ready" if df is not None else "wait")),
               ("Feature engineering and leakage checks", 4, "planned"), ("Built-in transformer", 5, "planned"),
               ("Evaluation and experiments", 6, "planned"), ("Hugging Face / Nemotron / API adapters", 7, "planned")]
     st.dataframe(pd.DataFrame([{"Stage": s, "Phase": p, "Status": {"done": "Done", "ready": "Ready to run",
@@ -277,6 +281,7 @@ def schema_editor():
                 new = new.with_overrides(df, task=task_override)
             st.session_state.roles, st.session_state.profile = new, None
             st.session_state.quality, st.session_state.preprocessing = None, None
+            st.session_state.preparer, st.session_state.levels = None, None
             st.success("Schema updated. Profile again to use the changes.")
             st.rerun()
         except ValueError as e:
@@ -510,8 +515,6 @@ def page_placeholder(name: str):
     st.title(name)
     phase = PHASE_OF_PAGE[name]
     descriptions = {
-        "Processing": "E0 raw, E1 quality processed and E2 feature engineered versions of the same rows, with a reproducible "
-                      "subset size and a temporal split.",
         "Experiments": "Run E0, E1 and E2 with identical model settings, seed and split.",
         "Results": "Comparison tables and charts of measured metrics.",
     }
@@ -522,6 +525,112 @@ def page_placeholder(name: str):
         st.dataframe(pd.DataFrame([{"Experiment": e, "Status": "Not run"} for e in ["E0 Raw", "E1 Quality processed",
                                                                                      "E2 Feature engineered"]]),
                      hide_index=True)
+
+
+def page_processing():
+    st.title("Processing")
+    df, schema, roles = st.session_state.df, st.session_state.schema, st.session_state.roles
+    if df is None:
+        st.info("Load a dataset first in Data upload.")
+        return
+    if not roles.target:
+        st.info("Choose a target column in Profiling first.")
+        return
+    st.markdown('<p class="tdi-lead">E0 raw, E1 quality processed and E2 feature engineered versions of the same '
+               "rows, with a reproducible subset size and a train / validation / test split shared by every "
+               "level.</p>", unsafe_allow_html=True)
+    cfg = config()
+    ps = schema_for_profiling(schema, roles, df)
+    try:
+        level_roles = infer_roles(df, ps, roles)
+    except ValueError as e:
+        st.warning(str(e))
+        return
+
+    with st.expander("Resolved roles and exclusions"):
+        c = st.columns(4)
+        c[0].metric("Time column", level_roles.time or "none")
+        c[1].metric("Entity column", level_roles.entity or "none")
+        c[2].metric("Amount column", level_roles.amount or "none")
+        c[3].metric("Category / merchant", f"{level_roles.category or '—'} / {level_roles.merchant or '—'}")
+        if not level_roles.entity or not level_roles.amount:
+            st.caption("E2's history features need an entity and an amount column; without them E2 gracefully skips "
+                      "that part and still runs.")
+        if level_roles.excluded:
+            st.caption(f"{len(level_roles.excluded)} columns excluded from every level (identifiers, personal data, "
+                      "quasi-identifiers — same policy for E0, E1 and E2):")
+            st.dataframe(pd.DataFrame([{"column": c, "reason": r} for c, r in level_roles.excluded.items()]),
+                        hide_index=True, width="stretch")
+
+    sc = cfg["subsets"]
+    options = [str(o) for o in sc["options"]]
+    default = str(sc["cpu_default"]) if str(sc["cpu_default"]) in options else options[0]
+    left, right = st.columns([2, 1])
+    subset = left.selectbox("Subset size (rows drawn for this run; reused by every level)", options,
+                            index=options.index(default), help="'full' uses every available row after the split.")
+    method = "temporal" if cfg["split"]["method"] == "temporal" and level_roles.time else "random"
+    f = cfg["split"]["fractions"]
+    right.metric("Split", method.capitalize(), help=f"{f[0]:.0%} train / {f[1]:.0%} validation / {f[2]:.0%} test")
+
+    if st.button("Prepare split and sample", type="primary", key="prepare_split"):
+        with st.spinner("Assigning train / validation / test and drawing the sample…"):
+            preparer = DataPreparer(df, ps, level_roles, cfg, rows="full" if subset == "full" else int(subset),
+                                    seed=cfg["project"]["seed"])
+            preparer.prepare_split()
+        st.session_state.preparer, st.session_state.levels = preparer, {}
+
+    preparer = st.session_state.preparer
+    if preparer is None:
+        st.info("Not prepared yet.")
+        return
+
+    info = preparer.split_info
+    st.subheader("Split and sample")
+    st.caption(f"Method: {info['boundaries']['method']} · prepared in {info['seconds']} s · "
+              f"{info['rows_unassigned']:,} rows unassigned (missing target or time)")
+    rep = info["sample"]
+    cols = st.columns(3)
+    for col, split in zip(cols, ["train", "validation", "test"]):
+        r = rep.get(split, {})
+        col.metric(split.capitalize(), f"{r.get('rows', 0):,} rows",
+                  help=f"{r.get('positives', 0):,} positives ({r.get('sample_positive_share', 0):.2%}); "
+                       f"represents {r.get('represents_rows', 0):,} rows at the real class balance")
+
+    st.subheader("Levels")
+    tabs = st.tabs(["E0 · Raw", "E1 · Quality processed", "E2 · Feature engineered"])
+    for tab, level in zip(tabs, ["E0", "E1", "E2"]):
+        with tab:
+            render_level(preparer, level)
+
+
+def render_level(preparer, level: str):
+    levels = st.session_state.levels
+    if level not in levels:
+        if st.button(f"Build {level}", key=f"build_{level}"):
+            with st.spinner(f"Building {level}…"):
+                levels[level] = preparer.build(level)
+        else:
+            st.info("Not built yet.")
+            return
+    prepared = levels[level]
+    info = prepared.info
+    c = st.columns(4)
+    c[0].metric("Features", info["features"])
+    c[1].metric("Train rows", f"{info['rows']['train']:,}")
+    c[2].metric("Validation rows", f"{info['rows']['validation']:,}")
+    c[3].metric("Test rows", f"{info['rows']['test']:,}")
+    st.caption(f"Positives — train {info['positives']['train']:,}, validation {info['positives']['validation']:,}, "
+              f"test {info['positives']['test']:,} · built in {info['seconds']} s")
+    st.markdown("**Steps**")
+    st.code("\n".join(info["steps"]), language=None)
+    pit = info.get("point_in_time")
+    if pit:
+        (st.success if pit["passed"] else st.error)(
+            f"Point-in-time check: {'passed' if pit['passed'] else 'FAILED'} on {pit['rows_checked']} sampled rows "
+            "(history features recomputed from truncated data must match the real ones)")
+    st.markdown("**Preview (train split)**")
+    preview_cols = [c for c in prepared.frames["train"].columns if not c.startswith("_")]
+    st.dataframe(prepared.frames["train"][preview_cols].head(20), width="stretch")
 
 
 def page_model():
@@ -551,6 +660,8 @@ def main():
             page_profiling()
         elif page == "Quality Analysis":
             page_quality()
+        elif page == "Processing":
+            page_processing()
         elif page == "Model":
             page_model()
         else:

@@ -136,3 +136,38 @@ def build_history_features(frame: pd.DataFrame, cfg: HistoryConfig, hour_col: st
         parts.append(merchant_history(frame, cfg))
     parts.append(previous_transactions(frame, cfg, hour_col))
     return pd.concat(parts, axis=1)
+
+
+def check_point_in_time(df: pd.DataFrame, feature_fn, time_col: str, group_col: str, n_samples: int = 200,
+                        seed: int = 0, atol: float = 1e-6) -> dict:
+    """Recompute features for sampled rows using only that row's group history up to (and including) the row.
+
+    feature_fn(frame) must return a DataFrame of feature columns indexed like `frame`. If a value computed on
+    the full data differs from the value computed on the truncated history, the feature used future rows.
+    """
+    order = df.sort_values([group_col, time_col], kind="mergesort")
+    full = feature_fn(order)
+    picks = order.sample(min(n_samples, len(order)), random_state=seed).index
+    pos = pd.Series(np.arange(len(order)), index=order.index)
+    mismatches = {c: 0 for c in full.columns}
+    examples = []
+    for idx in picks:
+        g = order[group_col].loc[idx]
+        group = order[order[group_col] == g]
+        history = group[pos.loc[group.index] <= pos.loc[idx]]
+        recomputed = feature_fn(history).loc[idx]
+        for c in full.columns:
+            a, b = full.at[idx, c], recomputed[c]
+            if pd.isna(a) or pd.isna(b):
+                same = pd.isna(a) and pd.isna(b)
+            elif isinstance(a, (int, float, np.number)) and isinstance(b, (int, float, np.number)):
+                same = bool(np.isclose(float(a), float(b), atol=atol))
+            else:
+                same = a == b
+            if not same:
+                mismatches[c] += 1
+                if len(examples) < 5:
+                    examples.append({"row": str(idx), "feature": c, "full_data_value": a, "history_only_value": b})
+    leaking = [c for c, n in mismatches.items() if n]
+    return {"rows_checked": int(len(picks)), "mismatches": mismatches, "leaking_features": leaking,
+            "passed": not leaking, "examples": examples}
