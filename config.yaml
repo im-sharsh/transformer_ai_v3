@@ -70,3 +70,10 @@ processing:                # Phase 3: E1 / E2 train-fitted transforms (missing v
 
 features:                  # Phase 3 (E2 history features); gracefully skipped if entity/time/amount are unavailable
   windows: ["1h", "24h", "7d", "30d"]
+
+leakage:                   # Phase 4: feature-level leakage scan on E1 / E2's final feature set; skipped if no
+                            # datetime column is set (there is nothing to hold out a "later period" with)
+  high_auc: 0.99            # a single feature predicting the target this well on the later period is high risk
+  medium_auc: 0.95
+  instability_gap: 0.10     # predictive under random folds but this much weaker on the later period: medium risk
+  holdout_fraction: 0.30    # only used as a fallback if the train/validation split boundary is unavailable

@@ -26,9 +26,13 @@ from src.preprocessing.datetime_features import add_time_features
 from src.preprocessing.pipeline import ColumnRoles, FittedPreprocessor, PreprocessingConfig
 from src.preprocessing.sampling import SampleConfig, draw_sample, sample_report
 from src.profiling.profiler import parse_datetime_column
+from src.quality.leakage_detector import LeakageDetector
 from src.quality.quality_engine import assess_quality
 
 LEVELS = {"E0": "Raw", "E1": "Quality processed", "E2": "Feature engineered"}
+# Only structural, unambiguous leaks are removed automatically. Strong predictive power alone (e.g. the amount)
+# is flagged for human review, never removed: a legitimate signal can be very predictive.
+AUTO_REMOVE_CHECKS = {"post_event_time", "target_word_in_text"}
 META = ["_row_id", "_split", "_target", "_weight", "_new_entity"]
 PII_EXCLUDE = {"person_name", "address", "card_number", "account_number", "email", "phone", "government_id",
                "location", "birth_date"}
@@ -171,7 +175,8 @@ class DataPreparer:
             split[t >= q2] = "test"
             split[t.isna()] = "unassigned"
             boundaries = {"train": f"{t.min()} to before {q1}", "validation": f"{q1} to before {q2}",
-                          "test": f"{q2} to {t.max()}", "method": "temporal (quantiles of event time)"}
+                          "test": f"{q2} to {t.max()}", "method": "temporal (quantiles of event time)",
+                          "cutoff": str(q1)}
         else:
             rng = np.random.default_rng(self.seed).random(len(df))
             split[rng >= f_train] = "validation"
@@ -287,10 +292,38 @@ class DataPreparer:
                  "transform_stats": stats, "quality_scores": quality.scores}
         return transformed, numeric_features, categorical, {"steps": steps, "audit": audit}
 
+    def _run_leakage(self, level: str, frame: pd.DataFrame, features: list) -> tuple[list, list, str]:
+        """Full feature-level leakage scan (Phase 4) on the level's final feature set. Needs a datetime column
+        to hold out a later period; returns (findings, auto-removed features, step message)."""
+        r = self.roles
+        present = [c for c in features if c in frame]
+        if not r.time:
+            return [], [], "Leakage checks skipped: no datetime column selected"
+        lcfg = self.cfg["leakage"]
+        scan = frame[["_row_id", "_target"] + present].copy()
+        scan["_event_time"] = self._event_times(frame)
+        if r.entity:
+            entity_of = self.df.set_index("_row_id")[r.entity]
+            scan[r.entity] = scan["_row_id"].map(entity_of)
+        det = LeakageDetector(target="_target", event_time="_event_time", entity=r.entity, roles=self.schema.by_role(),
+                              birth_columns=r.birth, cutoff=self.split_info.get("boundaries", {}).get("cutoff"),
+                              holdout_fraction=lcfg["holdout_fraction"], high_auc=lcfg["high_auc"],
+                              medium_auc=lcfg["medium_auc"], instability_gap=lcfg["instability_gap"], seed=self.seed)
+        report = det.detect(scan, dataset_id=level, features=present)
+        findings = [f.__dict__ for f in report.findings]
+        removed = sorted({f["feature"] for f in findings if f["leakage_risk"] == "high" and f["check"] in AUTO_REMOVE_CHECKS})
+        msg = (f"Leakage checks: {len(findings)} findings on {len(present)} features (cutoff {report.split['cutoff']}, "
+              f"{report.split['fit_rows']:,} fit rows / {report.split['holdout_rows']:,} later rows); "
+              f"removed structural leaks: {removed or 'none'} (other findings are for human review)")
+        return findings, removed, msg
+
     def _build_e1(self) -> PreparedLevel:
         frame, numeric, categorical, extra = self._e1_frame()
-        extra["steps"].append("Leakage checks: full feature-level scan not yet implemented (planned for Phase 4)")
-        return self._finish("E1", frame, numeric + categorical, extra["steps"], extra)
+        findings, removed, msg = self._run_leakage("E1", frame, numeric + categorical)
+        extra["steps"].append(msg)
+        extra["leakage"] = findings
+        kept = [c for c in numeric + categorical if c not in removed]
+        return self._finish("E1", frame, kept, extra["steps"], extra)
 
     def _event_times(self, frame):
         times = parse_datetime_column(self.df.set_index("_row_id")[self.roles.time], "datetime")
@@ -358,7 +391,10 @@ class DataPreparer:
         else:
             missing = [name for name, v in [("entity", r.entity), ("time", r.time), ("amount", r.amount)] if not v]
             extra["steps"].append(f"History features skipped: no {', '.join(missing)} column selected")
-        extra["steps"].append("Leakage checks: full feature-level scan not yet implemented (planned for Phase 4); "
-                              "history features are verified point-in-time above")
         feats = numeric + temporal_cols + hist_cols + categorical
-        return self._finish("E2", frame, feats, extra["steps"], extra)
+        findings, removed, msg = self._run_leakage("E2", frame, feats)
+        if hist_cols:
+            msg += " (history features are additionally verified point-in-time above)"
+        extra["steps"].append(msg)
+        extra["leakage"] = findings
+        return self._finish("E2", frame, [c for c in feats if c not in removed], extra["steps"], extra)

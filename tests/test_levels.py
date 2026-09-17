@@ -89,7 +89,7 @@ def test_e1_transforms_numeric_features_instead_of_using_raw_values(transactions
     assert {"amt__robust", "amt__log", "amt__bin"} <= set(e1.features)
     assert not any(c.startswith("trans_date_trans_time") for c in e1.features), "no absolute timestamp in E1 inputs"
     assert "unix_time" not in e1.features, "detected as a redundant systematic duplicate and dropped by cleaning"
-    assert any("Phase 4" in s for s in e1.info["steps"])   # leakage checks honestly reported as not yet implemented
+    assert any("Leakage checks:" in s for s in e1.info["steps"])
 
 
 def test_e1_adds_a_missing_value_indicator_fitted_on_train_rows_only(transactions):
@@ -126,6 +126,55 @@ def test_e2_adds_cyclical_time_and_point_in_time_safe_history_features(transacti
     assert "card_txn_count_before" not in e2.features, "diagnostic-only (grows with calendar time): not a model input"
     pit = e2.info["point_in_time"]
     assert pit["passed"], pit["examples"]
+
+
+def test_e2_leakage_findings_have_the_expected_shape(transactions):
+    ps, roles = _prepare(transactions, "tx")
+    lr = infer_roles(transactions, ps, roles)
+    dp = DataPreparer(transactions, ps, lr, CFG, rows=3000, seed=42)
+    dp.prepare_split()
+    e2 = dp.build("E2")
+    assert e2.info["leakage"], "the synthetic fraud-burst pattern should trigger at least one finding"
+    for f in e2.info["leakage"]:
+        assert {"feature", "check", "leakage_risk", "evidence", "reason", "recommendation"} <= set(f)
+        assert f["leakage_risk"] in {"high", "medium", "low", "info"}
+    assert any("Leakage checks:" in s and "findings" in s for s in e2.info["steps"])
+
+
+def test_e1_auto_removes_a_structural_text_leak(transactions):
+    """A column whose text reveals the label at very different rates per class is a structural leak
+    (check `target_word_in_text`) and is the one kind of finding this pipeline removes automatically."""
+    df = transactions.copy()
+    df["case_note"] = np.where(df["is_fraud"] == 1, "confirmed fraud reported", "normal purchase approved")
+    ps, roles = _prepare(df, "tx_leak")
+    lr = infer_roles(df, ps, roles)
+    dp = DataPreparer(df, ps, lr, CFG, rows=2000, seed=42)
+    dp.prepare_split()
+    e1 = dp.build("E1")
+    assert "case_note" not in e1.features
+    matches = [f for f in e1.info["leakage"] if f["feature"] == "case_note"]
+    assert any(f["check"] == "target_word_in_text" and f["leakage_risk"] == "high" for f in matches)
+
+
+def test_leakage_checks_are_review_only_for_predictive_power_alone(transactions):
+    """A genuinely predictive feature (the amount) must never be auto-removed just for being predictive."""
+    ps, roles = _prepare(transactions, "tx")
+    lr = infer_roles(transactions, ps, roles)
+    dp = DataPreparer(transactions, ps, lr, CFG, rows=3000, seed=42)
+    dp.prepare_split()
+    e2 = dp.build("E2")
+    assert any(c.startswith("amt__") for c in e2.features)
+
+
+def test_leakage_checks_skip_gracefully_without_a_datetime_column(transactions):
+    df = transactions.drop(columns=["trans_date_trans_time"])
+    ps, roles = _prepare(df, "tx_nodt")
+    lr = infer_roles(df, ps, roles)
+    dp = DataPreparer(df, ps, lr, CFG, rows=1000, seed=42)
+    dp.prepare_split()
+    e1 = dp.build("E1")
+    assert e1.info["leakage"] == []
+    assert any("Leakage checks skipped: no datetime column" in s for s in e1.info["steps"])
 
 
 def test_e2_gracefully_skips_history_features_without_entity_or_amount(churn):
