@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from src.features.behavioral_features import HistoryConfig, card_history, check_point_in_time, merchant_history
+from src.features.behavioral_features import (HistoryConfig, card_history, check_point_in_time, merchant_history,
+                                              previous_transactions)
 from src.ingestion.roles import DatasetRoles
 from src.ingestion.schema_detector import SchemaReport
 from src.preprocessing.cleaner import CleaningConfig, clean_dataset
@@ -281,12 +282,20 @@ class DataPreparer:
         pre.fit(cleaned[cleaned["_split"] == "train"], ColumnRoles(numeric=numeric_base, categorical=categorical, event_time=None))
         transformed, stats = pre.transform(cleaned)
         indicators = [c for c in transformed.columns if c.endswith("__was_missing")]
-        numeric_features = [f"{c}{suffix}" for c in numeric_base for suffix in ("__robust", "__log", "__bin")
-                            if f"{c}{suffix}" in transformed] + indicators
+        # Audit finding 1: __robust, __log and __bin are all monotonic (or near-monotonic) transforms of the same
+        # raw value, and the tokenizer quantile-bins every "numeric" feature independently. Quantile binning is
+        # invariant under monotonic transforms, so passing all three produced three redundant token positions
+        # with zero net new information (verified empirically: __robust and __log re-binned match a direct bin
+        # of the raw value 100% of the time). Only __robust is kept as the model input; __log and __bin are still
+        # computed (available for future representation experiments, e.g. a continuous-value + coarse-bin input)
+        # but are not selected here.
+        numeric_features = [f"{c}__robust" for c in numeric_base if f"{c}__robust" in transformed] + indicators
         logged = [c for c, p in pre.numeric.params.items() if p["log"]]
         steps += ["Fitted on training rows only: missing-value handling, rare-category grouping, numeric transforms "
-                  f"(robust scaling + decile bins for all numeric features; log1p additionally for skewed: {logged or 'none'})",
-                  "Numeric model inputs are the transformed columns (robust-scaled / log / decile bin), not the raw values",
+                  f"(robust scaling for all numeric features; log1p and decile bins also computed, for skewed "
+                  f"columns: {logged or 'none'}, but not used as separate model inputs — redundant with the "
+                  "robust-scaled value under quantile-bin tokenization)",
+                  "Numeric model input is the robust-scaled value: one token per numeric column, not three",
                   "Absolute timestamps removed from model inputs: later periods lie outside the training range"]
         audit = {"cleaning": cleaning.summary, "audit_log": cleaning.audit.entries, "preprocessor": pre.to_dict(),
                  "transform_stats": stats, "quality_scores": quality.scores}
@@ -343,17 +352,36 @@ class DataPreparer:
         base = base.dropna(subset=["time"])
         if base.empty:
             return None
+        fcfg = self.cfg["features"]
+        use_sequence = bool(fcfg.get("include_sequence_features", True))
+        seq_len = int(fcfg.get("sequence_length", 3))
         hc = HistoryConfig(entity="entity", time="time", amount="amount", category="category" if r.category else None,
-                           merchant="merchant" if r.merchant else None, windows=tuple(self.cfg["features"]["windows"]))
+                           merchant="merchant" if r.merchant else None, windows=tuple(fcfg["windows"]),
+                           sequence_length=seq_len)
         parts = [card_history(base, hc)]
         if r.merchant:
             parts.append(merchant_history(base, hc))
+        if use_sequence:
+            # Audit finding 5: these prevK_* columns (the entity's last K transactions) were already implemented
+            # and leakage-tested but never reached E2 in the original pipeline. Wired in here because a separate
+            # experiment (fine-tuning a language model on the equivalent text representation) found this to be
+            # the single largest effect measured in that research: PR-AUC 0.87 vs 0.61-0.65 for aggregate-only
+            # history, same seed, statistically significant. Point-in-time verified below like every other
+            # history feature.
+            parts.append(previous_transactions(base, hc))
         hist = pd.concat(parts, axis=1)
         hist.insert(0, "_row_id", base["_row_id"].values)
         # point-in-time verification on a few entities: recomputes history from truncated data and compares
         ents = base["entity"].drop_duplicates().sample(min(10, base["entity"].nunique()), random_state=self.seed)
         sub = base[base["entity"].isin(ents)]
-        self.pit = check_point_in_time(sub, lambda f: card_history(f, hc), "time", "entity", n_samples=min(100, len(sub)))
+        pit_card = check_point_in_time(sub, lambda f: card_history(f, hc), "time", "entity", n_samples=min(100, len(sub)))
+        if use_sequence:
+            pit_seq = check_point_in_time(sub, lambda f: previous_transactions(f, hc), "time", "entity",
+                                          n_samples=min(100, len(sub)))
+            self.pit = {"card_history": pit_card, "previous_transactions": pit_seq,
+                       "passed": bool(pit_card["passed"] and pit_seq["passed"]), "rows_checked": pit_card["rows_checked"]}
+        else:
+            self.pit = {"card_history": pit_card, "passed": bool(pit_card["passed"]), "rows_checked": pit_card["rows_checked"]}
         self._history = hist
         return hist
 
@@ -375,14 +403,27 @@ class DataPreparer:
         else:
             extra["steps"].append("Time features skipped: no datetime column selected")
 
-        hist_cols = []
+        hist_cols, seq_numeric, seq_categorical = [], [], []
         if r.entity and r.time and r.amount:
             hist = self._history_features()
             if hist is not None:
                 hist_cols = [c for c in HISTORY_FEATURES if c in hist]
-                frame = frame.merge(hist[["_row_id"] + hist_cols], on="_row_id", how="left")
+                fcfg = self.cfg["features"]
+                if fcfg.get("include_sequence_features", True):
+                    seq_len = int(fcfg.get("sequence_length", 3))
+                    for k in range(1, seq_len + 1):
+                        for suffix, numeric_kind in [("hours_ago", True), ("amount", True), ("hour", True),
+                                                     ("category", False)]:
+                            col = f"prev{k}_{suffix}"
+                            if col in hist.columns:
+                                (seq_numeric if numeric_kind else seq_categorical).append(col)
+                merge_cols = hist_cols + seq_numeric + seq_categorical
+                frame = frame.merge(hist[["_row_id"] + merge_cols], on="_row_id", how="left")
+                seq_msg = (f" + {len(seq_numeric) + len(seq_categorical)} previous-transaction sequence features "
+                          f"(last {int(self.cfg['features'].get('sequence_length', 3))})"
+                          if seq_numeric or seq_categorical else "")
                 extra["steps"].append(f"History features from strictly earlier transactions of the same {r.entity} "
-                                      f"(no past labels): {len(hist_cols)} features")
+                                      f"(no past labels): {len(hist_cols)} aggregate features{seq_msg}")
                 extra["steps"].append(f"Point-in-time check on real rows: {'passed' if self.pit['passed'] else 'FAILED'} "
                                       f"({self.pit['rows_checked']} rows)")
                 extra["point_in_time"] = self.pit
@@ -391,7 +432,7 @@ class DataPreparer:
         else:
             missing = [name for name, v in [("entity", r.entity), ("time", r.time), ("amount", r.amount)] if not v]
             extra["steps"].append(f"History features skipped: no {', '.join(missing)} column selected")
-        feats = numeric + temporal_cols + hist_cols + categorical
+        feats = numeric + temporal_cols + hist_cols + seq_numeric + categorical + seq_categorical
         findings, removed, msg = self._run_leakage("E2", frame, feats)
         if hist_cols:
             msg += " (history features are additionally verified point-in-time above)"

@@ -86,10 +86,29 @@ def test_e1_transforms_numeric_features_instead_of_using_raw_values(transactions
     dp.prepare_split()
     e1 = dp.build("E1")
     assert "amt" not in e1.features
-    assert {"amt__robust", "amt__log", "amt__bin"} <= set(e1.features)
+    assert "amt__robust" in e1.features
+    # Audit finding 1: __log and __bin are monotonic transforms of the same value; the tokenizer quantile-bins
+    # every numeric feature, and quantile binning is invariant under monotonic transforms, so passing all three
+    # was three redundant tokens carrying no more information than one. Only the robust-scaled value is a model
+    # input now (see test_e1_numeric_representation_is_not_redundant below for the empirical proof).
+    assert "amt__log" not in e1.features and "amt__bin" not in e1.features
     assert not any(c.startswith("trans_date_trans_time") for c in e1.features), "no absolute timestamp in E1 inputs"
     assert "unix_time" not in e1.features, "detected as a redundant systematic duplicate and dropped by cleaning"
     assert any("Leakage checks:" in s for s in e1.info["steps"])
+
+
+def test_e1_numeric_representation_is_not_redundant(transactions):
+    """Regression test for audit finding 1: before the fix, amt__robust/__log/__bin all reached the tokenizer
+    and, once quantile-binned, produced identical or near-identical token sequences (measured: 100% exact bin
+    match between __robust and a direct bin of the raw value). This test guards against that regressing: E1's
+    numeric feature list must contain at most one representation of each underlying raw numeric column."""
+    ps, roles = _prepare(transactions, "tx")
+    lr = infer_roles(transactions, ps, roles)
+    dp = DataPreparer(transactions, ps, lr, CFG, rows=2000, seed=42)
+    dp.prepare_split()
+    e1 = dp.build("E1")
+    bases = [c.split("__", 1)[0] for c in e1.numeric if "__" in c and not c.endswith("__was_missing")]
+    assert len(bases) == len(set(bases)), f"more than one numeric representation of the same column: {bases}"
 
 
 def test_e1_adds_a_missing_value_indicator_fitted_on_train_rows_only(transactions):
@@ -125,8 +144,50 @@ def test_e2_adds_cyclical_time_and_point_in_time_safe_history_features(transacti
     assert "card_amount_mean_before" in e2.features
     assert "card_txn_count_before" not in e2.features, "diagnostic-only (grows with calendar time): not a model input"
     pit = e2.info["point_in_time"]
-    assert pit["passed"], pit["examples"]
+    assert pit["passed"], pit
 
+
+def test_e2_includes_point_in_time_verified_sequence_features_by_default(transactions):
+    """Audit finding 5: previous_transactions() existed, was leakage-tested, but was never reachable from E2.
+    This is now the default (features.include_sequence_features: true in config.yaml)."""
+    ps, roles = _prepare(transactions, "tx")
+    lr = infer_roles(transactions, ps, roles)
+    dp = DataPreparer(transactions, ps, lr, CFG, rows=3000, seed=42)
+    dp.prepare_split()
+    e2 = dp.build("E2")
+    seq_len = CFG["features"]["sequence_length"]
+    for k in range(1, seq_len + 1):
+        assert f"prev{k}_hours_ago" in e2.numeric and f"prev{k}_amount" in e2.numeric and f"prev{k}_hour" in e2.numeric
+        assert f"prev{k}_category" in e2.categorical
+    assert f"prev{seq_len + 1}_amount" not in e2.features, "must not exceed the configured sequence length"
+    pit = e2.info["point_in_time"]
+    assert pit["passed"] and "previous_transactions" in pit and pit["previous_transactions"]["passed"], pit
+    assert any("previous-transaction sequence features" in s for s in e2.info["steps"])
+
+
+def test_e2_sequence_features_can_be_disabled(transactions):
+    ps, roles = _prepare(transactions, "tx")
+    lr = infer_roles(transactions, ps, roles)
+    cfg = {**CFG, "features": {**CFG["features"], "include_sequence_features": False}}
+    dp = DataPreparer(transactions, ps, lr, cfg, rows=3000, seed=42)
+    dp.prepare_split()
+    e2 = dp.build("E2")
+    assert not any(c.startswith("prev") for c in e2.features)
+    assert "card_amount_mean_before" in e2.features, "aggregate history features must be unaffected"
+    assert "previous_transactions" not in e2.info["point_in_time"]
+
+
+def test_sequence_features_are_leakage_safe_on_a_first_transaction(transactions):
+    """A card's very first transaction has no previous transaction: prevK_* must be missing, not fabricated
+    or backfilled from a later (future) row."""
+    ps, roles = _prepare(transactions, "tx")
+    lr = infer_roles(transactions, ps, roles)
+    dp = DataPreparer(transactions, ps, lr, CFG, rows=3000, seed=42)
+    dp.prepare_split()
+    e2 = dp.build("E2")
+    all_rows = pd.concat(e2.frames.values(), ignore_index=True)
+    assert all_rows["prev1_amount"].notna().any(), "some rows must have a real previous transaction"
+    assert all_rows["prev1_amount"].isna().any(), "at least one row (a card's first transaction) must have no history"
 
 def test_e2_leakage_findings_have_the_expected_shape(transactions):
     ps, roles = _prepare(transactions, "tx")

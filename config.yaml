@@ -70,6 +70,11 @@ processing:                # Phase 3: E1 / E2 train-fitted transforms (missing v
 
 features:                  # Phase 3 (E2 history features); gracefully skipped if entity/time/amount are unavailable
   windows: ["1h", "24h", "7d", "30d"]
+  include_sequence_features: true  # audit finding 5: the entity's last `sequence_length` transactions
+                                    # (hours ago / amount / hour / category), point-in-time verified. This
+                                    # code existed and was tested but was never wired into E2 before the audit.
+  sequence_length: 3               # kept small by default for the CPU-friendly built-in transformer (more
+                                    # positions = more tokens per row); raise if you have GPU budget
 
 leakage:                   # Phase 4: feature-level leakage scan on E1 / E2's final feature set; skipped if no
                             # datetime column is set (there is nothing to hold out a "later period" with)
