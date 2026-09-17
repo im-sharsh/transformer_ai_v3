@@ -6,7 +6,7 @@ inspection, adaptation to the current interfaces and tests.
 
 | File | Target phase | Origin | Verification state |
 |---|---|---|---|
-| src/preprocessing/outliers.py | 3 or 6 (robustness) | research notebooks | tested there; also fitted on training rows. Not wired in for Phase 3: flagging-only outlier handling wasn't in the Phase 3 brief; revisit for Phase 6 robustness |
+| src/preprocessing/outliers.py | 3 or 6 (robustness) | research notebooks | tested there; also fitted on training rows. Never wired in through Phase 8: not required by any phase as specified, and adding it now would be a new pipeline feature, not the polish Phase 8's brief asked for. Revisit if outlier *handling* (beyond the profiling counts already shown) turns out to matter on the real dataset |
 | src/preprocessing/split.py | superseded | research notebooks | tested there, but needs an explicit `train_end` / `test_start` date per dataset. `DataPreparer.prepare_split` (Phase 3, `src/preprocessing/levels.py`) uses a quantile-of-fractions temporal split instead, so it works on any dataset without per-dataset dates; kept here for reference |
 | tests/synthetic.py | 3+ | drafted | copy now lives in src/ingestion/demo_data.py |
 
