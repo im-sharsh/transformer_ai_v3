@@ -8,10 +8,6 @@ inspection, adaptation to the current interfaces and tests.
 |---|---|---|---|
 | src/preprocessing/outliers.py | 3 or 6 (robustness) | research notebooks | tested there; also fitted on training rows. Not wired in for Phase 3: flagging-only outlier handling wasn't in the Phase 3 brief; revisit for Phase 6 robustness |
 | src/preprocessing/split.py | superseded | research notebooks | tested there, but needs an explicit `train_end` / `test_start` date per dataset. `DataPreparer.prepare_split` (Phase 3, `src/preprocessing/levels.py`) uses a quantile-of-fractions temporal split instead, so it works on any dataset without per-dataset dates; kept here for reference |
-| src/representation/transaction_formatter.py | 5/7 | research notebooks | tested there. `find_quasi_identifiers` was reimplemented (not imported) as a small local helper in `src/preprocessing/levels.py` for Phase 3's exclusion policy, so the rest of this file (LLM text formatting) stays deferred to phase 5/7 |
-| src/representation/text_builder.py | 7 | drafted | **unverified draft** |
-| src/models/hf_backend.py | 7 | research notebooks (Nemotron LoRA on T4) | tested there |
-| src/models/hf_adapter.py, api_adapter.py, registry.py | 7 | drafted | **unverified draft** |
 | tests/synthetic.py | 3+ | drafted | copy now lives in src/ingestion/demo_data.py |
 
 Moved into `src/` during Phase 3 (see `PROJECT_STATUS.md`): `src/preprocessing/missing_values.py`, `categorical.py`,
@@ -47,3 +43,25 @@ leaving `self.model` / `self.tokenizer` overwritten with that throwaway (2-epoch
 Calling `train()` then `sanity_checks()` then `evaluate()` — exactly what the Model page does — silently evaluated
 the throwaway model, not the real one. `sanity_checks()` now saves and restores `self.model` / `self.tokenizer`
 around its internal checks (`try`/`finally`), so it has no side effects on an already-trained adapter.
+
+Moved into `src/` during Phase 7: `src/models/hf_adapter.py`, `hf_backend.py`, `api_adapter.py`, `registry.py`,
+`src/representation/text_builder.py`, `transaction_formatter.py`, all unchanged **except** `hf_adapter.py`'s
+`_load()`, which now passes an optional `target_modules` from `config.yaml` instead of always using
+`hf_backend.py`'s LLaMA-family default (`q_proj`, `k_proj`, ...). Found by actually running it: LoRA attachment
+on `gpt2` failed outright (`NoMatchingPeftModuleError`) because GPT-2's attention module is named `c_attn`, not
+`q_proj`/`k_proj`/`v_proj` — an architecture-specific assumption baked into the original Nemotron-focused code.
+`config.yaml`'s `models.huggingface.target_modules: [c_attn]` now matches the shipped `model_id: gpt2` default;
+a LLaMA-family model (including Nemotron, which needs no override) still gets the correct default automatically.
+`transformers`/`peft`/`accelerate` added to `requirements.txt` as **optional** (commented out): the app runs
+fully without them, and `HuggingFaceAdapter.availability()` reports the backend unavailable with a clear reason
+if they're missing, rather than the app failing to start.
+
+**Verified for real, not just wired up:** with the fix above, a full train → predict → evaluate → save → load
+cycle was run against `distilgpt2` (a real, small, public Hugging Face model — not a fabricated checkpoint) LoRA-
+fine-tuned on CPU: 21 optimizer steps in 6.9 s, validation PR-AUC 0.71, save/load round-trip gave identical
+predictions (`tests/test_backends.py`). The Custom/API adapter was verified against a real local HTTP server
+(`tests/test_backends.py`'s `local_api_server` fixture) matching its documented `{"prompts": [...]} ->
+{"probabilities": [...]}` contract, including that it correctly rejects an out-of-range response. Nemotron was
+**not** run: per section 13/14 of the brief ("do NOT invent a model checkpoint"; requires a CUDA GPU), and this
+environment has neither a verified checkpoint/config nor a GPU, `NemotronAdapter.availability()` honestly
+reports it unavailable here rather than a fabricated success.

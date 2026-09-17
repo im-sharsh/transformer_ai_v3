@@ -89,16 +89,3 @@ def basic_data_checks(prepared) -> list[dict]:
         check("Labels valid", set(pd.concat([f["_target"] for f in fr.values()]).dropna().unique()) <= {0, 1} and y.nunique() == 2,
               f"training positives {int(y.sum()):,} of {len(y):,}"),
     ]
-
-
-# Backends planned for the UI; status is shown honestly until each is implemented.
-PLANNED_BACKENDS = [
-    {"key": "sanity_transformer", "label": "Built-in Sanity Transformer", "phase": 5,
-     "description": "Small tabular transformer trained from scratch; runs on CPU.", "implemented": True},
-    {"key": "huggingface", "label": "Hugging Face Model", "phase": 7,
-     "description": "Configurable model from the Hugging Face Hub through an adapter.", "implemented": False},
-    {"key": "nemotron", "label": "Nemotron", "phase": 7,
-     "description": "Small NVIDIA Nemotron checkpoint (configurable); requires a CUDA GPU.", "implemented": False},
-    {"key": "api", "label": "Custom/API Model", "phase": 7,
-     "description": "Your own model behind an HTTP endpoint.", "implemented": False},
-]

@@ -49,9 +49,12 @@ class HuggingFaceAdapter(ModelAdapter):
     def _load(self):
         from src.models import hf_backend as B
         device, dtype = B.pick_device_and_dtype()
-        mc = B.ModelConfig(model_id=self.mcfg["model_id"], load_in_4bit=bool(self.mcfg.get("load_in_4bit")) and device == "cuda",
-                           lora_r=self.mcfg["lora_r"], lora_alpha=self.mcfg["lora_alpha"], lora_dropout=self.mcfg["lora_dropout"],
-                           gradient_checkpointing=device == "cuda")
+        kwargs = {"model_id": self.mcfg["model_id"], "load_in_4bit": bool(self.mcfg.get("load_in_4bit")) and device == "cuda",
+                 "lora_r": self.mcfg["lora_r"], "lora_alpha": self.mcfg["lora_alpha"], "lora_dropout": self.mcfg["lora_dropout"],
+                 "gradient_checkpointing": device == "cuda"}
+        if self.mcfg.get("target_modules"):          # LoRA target module names are architecture-specific (e.g.
+            kwargs["target_modules"] = list(self.mcfg["target_modules"])   # q_proj/... for LLaMA, c_attn for GPT-2)
+        mc = B.ModelConfig(**kwargs)
         self.tokenizer = B.load_tokenizer(mc.model_id)
         base = B.load_base_model(mc, dtype)
         if device == "cuda" and not mc.load_in_4bit:

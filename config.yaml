@@ -81,6 +81,7 @@ leakage:                   # Phase 4: feature-level leakage scan on E1 / E2's fi
 representation:            # Phase 5: turns E0/E1/E2 features into token ids, the same way for every level
   numeric_bins: 16          # quantile bins per numeric feature, fitted on training rows
   min_category_count: 5     # categorical values seen fewer times than this in training become "unknown"
+  max_tokens: 256           # Phase 7: prompt length budget for the language-model backends (text representation)
 
 models:
   sanity_transformer:       # Phase 5: built-in small Transformer (CPU-friendly; not meant to be state of the art)
@@ -95,3 +96,42 @@ models:
     epochs: 15
     patience: 3              # stop after this many epochs without a validation PR-AUC improvement
     seed: 42
+
+  huggingface:               # Phase 7: any compatible causal LM from the Hub, LoRA-fine-tuned on text rows.
+                              # Needs transformers/peft/accelerate (optional, see requirements.txt); on CPU only,
+                              # even this small a model is slow to fine-tune — use a small subset.
+    model_id: gpt2
+    target_modules: [c_attn]  # LoRA target modules are architecture-specific: c_attn is GPT-2's combined QKV
+                              # projection; a LLaMA-family model needs [q_proj, k_proj, v_proj, o_proj, ...] instead
+    load_in_4bit: false       # only applied on a CUDA GPU; ignored on CPU
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    epochs: 1
+    batch_size: 8
+    gradient_accumulation_steps: 2
+    learning_rate: 0.0002
+    seed: 42
+    eval_every_steps: 50
+    checkpoint_every_steps: 50
+
+  nemotron:                  # Phase 7: requires a CUDA GPU with enough memory (e.g. Colab T4); not usable on
+                              # CPU-only machines — availability() reports this honestly rather than pretending.
+    model_id: nvidia/Llama-3.1-Nemotron-Nano-4B-v1.1
+    min_gpu_memory_gb: 12
+    load_in_4bit: true
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    epochs: 1
+    batch_size: 4
+    gradient_accumulation_steps: 4
+    learning_rate: 0.0002
+    seed: 42
+    eval_every_steps: 50
+    checkpoint_every_steps: 50
+
+  api:                       # Phase 7: your own model behind an HTTP endpoint (inference only; no local training)
+    endpoint: null            # e.g. https://your-service/predict ; null = unavailable until you set this
+    batch_size: 32
+    timeout_seconds: 30

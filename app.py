@@ -19,7 +19,7 @@ from src.ingestion.loader import DatasetIntegrityError, UnsupportedFormatError, 
 from src.ingestion.roles import (ROLE_LABELS, TASK_LABELS, TASKS, detect_roles, entity_summary, leakage_indicators,
                                  schema_for_profiling, target_summary, time_summary)
 from src.ingestion.schema_detector import detect_schema
-from src.models.base import PLANNED_BACKENDS
+from src.models.registry import available_backends, get_adapter
 from src.models.sanity_transformer import SanityTransformerAdapter
 from src.preprocessing.basic_preprocessing import run_basic_preprocessing
 from src.preprocessing.cleaner import CleaningConfig
@@ -639,12 +639,16 @@ def render_level(preparer, level: str):
 def page_model():
     st.title("Model")
     hw = hardware()
+    cfg = config()
     st.markdown(f"**Detected device:** {'CUDA GPU (' + hw['gpu_name'] + ')' if hw['cuda'] else 'CPU'}")
     for level, msg in recommendations(hw):
         (st.success if level == "ok" else st.warning)(msg)
+    st.subheader("Backends")
+    st.caption("Availability is checked for real against this machine and this config.yaml, not just listed.")
+    backends = available_backends(hw, cfg)
     st.dataframe(pd.DataFrame([{"Backend": b["label"], "Description": b["description"],
-                                "Status": "Implemented" if b.get("implemented") else f"Not yet implemented (Phase {b['phase']})"}
-                               for b in PLANNED_BACKENDS]), hide_index=True, width="stretch")
+                                "Available": "yes" if b["available"] else "no", "Why": b["message"]}
+                               for b in backends]), hide_index=True, width="stretch")
 
     st.divider()
     st.subheader("Train the built-in Sanity Transformer")
@@ -655,7 +659,6 @@ def page_model():
         st.info("Build at least one level (E0 / E1 / E2) on the Processing page first.")
         return
 
-    cfg = config()
     mcfg = cfg["models"]["sanity_transformer"]
     level = st.selectbox("Data level", list(levels), format_func=lambda l: f"{l} · {levels[l].info['name']} "
                          f"({levels[l].info['features']} features)")
@@ -682,6 +685,28 @@ def page_model():
     trained = st.session_state.model
     if trained:
         render_model_results(trained)
+
+    st.divider()
+    st.subheader("Other backends (Phase 7)")
+    st.caption("Hugging Face and Custom/API are adapters, not full training UIs like the built-in Transformer "
+              "above (section 13: \"can be implemented through an adapter\"). This runs each backend's own "
+              "sanity checks against the selected level — real checks against the real backend, not a canned "
+              "status.")
+    other = [b for b in backends if b["key"] != "sanity_transformer"]
+    other_key = st.selectbox("Backend", [b["key"] for b in other],
+                             format_func=lambda k: next(b["label"] for b in other if b["key"] == k), key="other_backend")
+    chosen = next(b for b in other if b["key"] == other_key)
+    if not chosen["available"]:
+        st.warning(f"Not available: {chosen['message']}")
+    elif st.button(f"Run sanity checks for {chosen['label']}", key="run_other_backend_checks"):
+        with st.spinner(f"Checking {chosen['label']} on {level}…"):
+            try:
+                adapter = get_adapter(other_key, cfg)
+                checks = adapter.sanity_checks(levels[level])
+            except Exception as e:
+                checks = [{"check": "Sanity checks ran without an exception", "status": "fail", "detail": str(e)}]
+        st.dataframe(pd.DataFrame([{"Check": c["check"], "Status": c["status"], "Detail": c["detail"]} for c in checks]),
+                    hide_index=True, width="stretch")
 
 
 def _fmt_metric(v):
