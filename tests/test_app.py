@@ -38,3 +38,27 @@ def test_demo_flow_upload_schema_profile():
     at.sidebar.radio[0].set_value("Dashboard").run()
     _no_errors(at)
     assert any(m.label == "Target" and m.value == "is_fraud" for m in at.metric)
+
+
+def test_demo_flow_quality_and_basic_preprocessing():
+    at = streamlit_testing.AppTest.from_file(APP, default_timeout=180).run()
+    at.sidebar.radio[0].set_value("Data Upload").run()
+    at.button(key="load_demo").click().run()
+    at.sidebar.radio[0].set_value("Quality Analysis").run()
+    _no_errors(at)
+
+    at.button(key="run_quality").click().run()
+    _no_errors(at)
+    quality = at.session_state["quality"]
+    assert quality is not None and quality.scores["overall"] is not None
+    assert quality.scores["completeness"]["score"] == 100.0
+
+    at.button(key="run_preprocessing").click().run()
+    _no_errors(at)
+    prep = at.session_state["preprocessing"]
+    assert prep is not None
+    assert "unix_time" in prep.summary.dropped_columns
+    assert prep.summary.rows_before == prep.summary.rows_after   # no duplicates in the demo data
+
+    at.sidebar.radio[0].set_value("Dashboard").run()
+    _no_errors(at)

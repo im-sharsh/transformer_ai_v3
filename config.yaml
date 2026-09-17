@@ -27,6 +27,25 @@ profiling:
   rare_threshold: 0.001       # categories below this share are reported as rare
   skew_warning: 2.0
 
+quality:
+  weights: null                # null = default weights (completeness .25, validity .25, consistency .20,
+                                # uniqueness .15, integrity .15); a dimension with no applicable checks is
+                                # excluded and the rest are re-weighted, never scored as 100
+  large_dataset_warn_rows: 300000   # above this, the UI warns that quality analysis may take a while
+
+preprocessing:                 # basic preprocessing (Phase 2): stateless, safe before any train/test split
+  drop_systematic_redundant_columns: true
+  drop_row_index: true
+  drop_constant_columns: true
+  convert_types: true
+  zero_pad_codes: true
+  normalize_whitespace: true
+  merge_case_variants: true
+  strip_shared_prefixes: true
+  invalid_value_policy: nullify      # nullify | quarantine
+  quarantine_missing_mandatory: true
+  duplicate_policy: remove           # remove | quarantine | retain
+
 subsets:                  # later phase (Processing)
   options: [10000, 50000, 100000, 200000, 500000, full]
   cpu_default: 20000

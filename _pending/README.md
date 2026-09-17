@@ -6,9 +6,8 @@ inspection, adaptation to the current interfaces and tests.
 
 | File | Target phase | Origin | Verification state |
 |---|---|---|---|
-| src/quality/quality_engine.py, validators.py | 2 | research notebooks | tested there; not yet in this repo |
-| src/utils/audit.py | 2 | research notebooks | tested there |
-| src/preprocessing/cleaner.py, duplicates.py, missing_values.py, categorical.py, numerical.py, pipeline.py, outliers.py | 2–3 | research notebooks | tested there |
+| src/preprocessing/missing_values.py, categorical.py, numerical.py, datetime_features.py, pipeline.py | 3 | research notebooks | tested there. **Train-fitted** (imputation values, rare-category vocabulary, scaling parameters are fit on training rows only), so they need the split from Phase 3 before they can be wired in |
+| src/preprocessing/outliers.py | 3 or 6 (robustness) | research notebooks | tested there; also fitted on training rows |
 | src/preprocessing/split.py, sampling.py | 3 | research notebooks | tested there |
 | src/preprocessing/levels.py | 3 | drafted for the E0/E1/E2 brief | **unverified draft** |
 | src/features/behavioral_features.py | 4 | research notebooks | tested there (brute-force + point-in-time) |

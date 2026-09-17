@@ -19,7 +19,10 @@ from src.ingestion.roles import (ROLE_LABELS, TASK_LABELS, TASKS, detect_roles, 
                                  schema_for_profiling, target_summary, time_summary)
 from src.ingestion.schema_detector import detect_schema
 from src.models.base import PLANNED_BACKENDS
+from src.preprocessing.basic_preprocessing import run_basic_preprocessing
+from src.preprocessing.cleaner import CleaningConfig
 from src.profiling.profiler import profile_dataset
+from src.quality.quality_engine import assess_quality
 from src.utils.config import ROOT, load_config
 from src.utils.hardware import detect_hardware, recommendations
 
@@ -27,7 +30,7 @@ logging.basicConfig(level=logging.WARNING)
 st.set_page_config(page_title="Transaction Data Intelligence", layout="wide")
 
 PAGES = ["Dashboard", "Data Upload", "Profiling", "Quality Analysis", "Processing", "Model", "Experiments", "Results"]
-PHASE_OF_PAGE = {"Quality Analysis": 2, "Processing": 3, "Model": 5, "Experiments": 6, "Results": 6}
+PHASE_OF_PAGE = {"Processing": 3, "Model": 5, "Experiments": 6, "Results": 6}
 
 CSS = """
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
@@ -59,7 +62,7 @@ h2, h3 { font-weight: 600; letter-spacing: -0.005em; }
 # ------------------------------------------------------------------ state and cached work
 def init_state():
     defaults = {"nav": "Dashboard", "df": None, "meta": None, "schema": None, "roles": None, "profile": None,
-                "profile_info": None, "source": None, "error": None}
+                "profile_info": None, "source": None, "error": None, "quality": None, "preprocessing": None}
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
 
@@ -94,7 +97,8 @@ def set_dataset(path: Path, source: str):
         roles = roles.with_overrides(ds.df, entity=overrides.get("entity_column"), datetime=overrides.get("datetime_column"),
                                      task=hints.get("task"))
     st.session_state.update(df=ds.df, meta=ds.metadata, schema=schema, roles=roles, profile=None, profile_info=None,
-                            source=source, error=None, load_seconds=round(time.time() - t0, 1))
+                            quality=None, preprocessing=None, source=source, error=None,
+                            load_seconds=round(time.time() - t0, 1))
 
 
 def save_upload(uploaded) -> Path:
@@ -117,14 +121,16 @@ def sidebar():
         st.radio("Section", PAGES, key="nav", label_visibility="collapsed")
         st.divider()
         st.markdown("**Pipeline**")
-        df, roles, prof = st.session_state.df, st.session_state.roles, st.session_state.profile
+        df, roles = st.session_state.df, st.session_state.roles
+        prof, qual, prep = st.session_state.profile, st.session_state.quality, st.session_state.preprocessing
         steps = [("Load data", "done" if df is not None else "ready"),
                  ("Confirm schema and task", "done" if roles is not None and roles.target else ("ready" if df is not None else "wait")),
                  ("Profile", "done" if prof is not None else ("ready" if df is not None else "wait")),
-                 ("Quality analysis", "wait"), ("Process E0 / E1 / E2", "wait"), ("Train and evaluate", "wait"),
-                 ("Compare experiments", "wait")]
+                 ("Quality analysis", "done" if qual is not None else ("ready" if df is not None else "wait")),
+                 ("Basic preprocessing", "done" if prep is not None else ("ready" if df is not None else "wait")),
+                 ("Process E0 / E1 / E2", "wait"), ("Train and evaluate", "wait"), ("Compare experiments", "wait")]
         html = "".join(f'<div class="tdi-step tdi-{state}"><span class="n">{i}</span><span>{name}'
-                       f'{" <small>(later phase)</small>" if state == "wait" and i > 3 else ""}</span></div>'
+                       f'{" <small>(later phase)</small>" if state == "wait" and i > 5 else ""}</span></div>'
                        for i, (name, state) in enumerate(steps, start=1))
         st.markdown(html, unsafe_allow_html=True)
         st.divider()
@@ -165,10 +171,13 @@ def page_dashboard():
     status = [("Data upload", 1, "done" if df is not None else "ready"),
               ("Schema and task detection", 1, "done" if roles is not None else "ready"),
               ("Profiling", 1, "done" if st.session_state.profile is not None else "ready"),
-              ("Quality analysis", 2, "planned"), ("E0 / E1 / E2 processing", 3, "planned"),
+              ("Quality analysis", 2, "done" if st.session_state.quality is not None else ("ready" if df is not None else "wait")),
+              ("Basic preprocessing", 2, "done" if st.session_state.preprocessing is not None else ("ready" if df is not None else "wait")),
+              ("E0 / E1 / E2 processing", 3, "planned"),
               ("Feature engineering and leakage checks", 4, "planned"), ("Built-in transformer", 5, "planned"),
               ("Evaluation and experiments", 6, "planned"), ("Hugging Face / Nemotron / API adapters", 7, "planned")]
     st.dataframe(pd.DataFrame([{"Stage": s, "Phase": p, "Status": {"done": "Done", "ready": "Ready to run",
+                                                                   "wait": "Load data first",
                                                                    "planned": "Not yet implemented"}[k]} for s, p, k in status]),
                  hide_index=True, width="stretch")
 
@@ -267,6 +276,7 @@ def schema_editor():
             if task_override and task_override != new.task:
                 new = new.with_overrides(df, task=task_override)
             st.session_state.roles, st.session_state.profile = new, None
+            st.session_state.quality, st.session_state.preprocessing = None, None
             st.success("Schema updated. Profile again to use the changes.")
             st.rerun()
         except ValueError as e:
@@ -387,12 +397,119 @@ def render_profile(prof, info):
         st.dataframe(ind, hide_index=True, width="stretch") if len(ind) else st.success("No indicators found")
 
 
+def page_quality():
+    st.title("Quality Analysis")
+    df, schema, roles = st.session_state.df, st.session_state.schema, st.session_state.roles
+    if df is None:
+        st.info("Load a dataset first in Data upload.")
+        return
+    cfg = config()
+    ps = schema_for_profiling(schema, roles, df)
+    if len(df) > cfg["quality"]["large_dataset_warn_rows"]:
+        st.info(f"{len(df):,} rows: this may take a little while. Nothing is modified until you click Apply.")
+
+    st.subheader("Data quality")
+    st.caption("Five dimensions, each scored from checks generated from the detected roles: completeness, validity, "
+              "consistency, uniqueness, integrity. A dimension with no applicable checks is left out of the score "
+              "rather than counted as perfect. Nothing is deleted at this stage.")
+    if st.button("Run quality analysis", type="primary", key="run_quality"):
+        with st.spinner("Assessing data quality…"):
+            weights = cfg["quality"]["weights"]
+            st.session_state.quality = assess_quality(df, ps, **({"weights": weights} if weights else {}))
+        st.session_state.preprocessing = None
+    render_quality(st.session_state.quality)
+
+    st.divider()
+    st.subheader("Basic preprocessing")
+    st.caption("Stateless steps only (safe before any train/validation/test split exists): type normalization, "
+              "duplicate handling, invalid-value handling, categorical whitespace/case normalization, datetime "
+              "parsing. Value imputation, rare-category grouping and scaling are fitted on training rows only and "
+              "run during E1 / E2 processing (Phase 3).")
+    pc = cfg["preprocessing"]
+    c = st.columns(3)
+    dup_policy = c[0].selectbox("Duplicate rows", ["remove", "quarantine", "retain"],
+                                index=["remove", "quarantine", "retain"].index(pc["duplicate_policy"]),
+                                help="remove: delete extra copies. quarantine: set aside for review. retain: keep, only report.")
+    invalid_policy = c[1].selectbox("Invalid values", ["nullify", "quarantine"],
+                                    index=["nullify", "quarantine"].index(pc["invalid_value_policy"]),
+                                    help="nullify: set the impossible value to missing. quarantine: set the whole row aside.")
+    drop_redundant = c[2].checkbox("Drop columns the quality check flags as systematically redundant",
+                                   value=pc["drop_systematic_redundant_columns"])
+    if st.button("Run basic preprocessing", type="primary", key="run_preprocessing"):
+        pcfg = CleaningConfig(drop_systematic_redundant_columns=drop_redundant, drop_row_index=pc["drop_row_index"],
+                              drop_constant_columns=pc["drop_constant_columns"], convert_types=pc["convert_types"],
+                              zero_pad_codes=pc["zero_pad_codes"], normalize_whitespace=pc["normalize_whitespace"],
+                              merge_case_variants=pc["merge_case_variants"], strip_shared_prefixes=pc["strip_shared_prefixes"],
+                              invalid_value_policy=invalid_policy, quarantine_missing_mandatory=pc["quarantine_missing_mandatory"],
+                              duplicate_policy=dup_policy)
+        with st.spinner("Running basic preprocessing…"):
+            st.session_state.preprocessing = run_basic_preprocessing(df, ps, roles, config=pcfg)
+    render_preprocessing(st.session_state.preprocessing)
+
+
+def render_quality(report):
+    if report is None:
+        st.info("Not run yet.")
+        return
+    st.caption(f"Assessed {report.rows:,} rows in {report.seconds} s")
+    dims = ["completeness", "validity", "consistency", "uniqueness", "integrity"]
+    cols = st.columns(len(dims) + 1)
+    for col, dim in zip(cols, dims):
+        s = report.scores[dim]["score"]
+        col.metric(dim.capitalize(), f"{s:.1f}" if s is not None else "n/a",
+                  help=f"{report.scores[dim]['checks']} checks" if s is not None else "no applicable checks")
+    cols[-1].metric("Overall", f"{report.scores['overall']:.1f}")
+    if report.systematic_issues:
+        st.warning("Systematic issues (affect most rows; a column-level problem, not individual bad records): "
+                   + ", ".join(f"`{c}`" for c in report.systematic_issues))
+    st.metric("Rows with at least one individual issue", f"{report.records_with_issues:,}")
+    rows = [{"Dimension": c.dimension, "Check": c.name, "Failed": f"{c.failed:,} {c.unit}",
+            "Pass %": round(c.pass_rate * 100, 3), "Severity": c.severity, "Source": c.source,
+            "Details": str(c.details)[:200]} for c in report.checks]
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    if report.notes:
+        with st.expander("Notes"):
+            for n in report.notes:
+                st.markdown(f"- {n}")
+
+
+def render_preprocessing(result):
+    if result is None:
+        st.info("Not run yet.")
+        return
+    s = result.summary
+    c = st.columns(4)
+    c[0].metric("Rows", f"{s.rows_after:,}", delta=f"{s.rows_after - s.rows_before:,}" if s.rows_after != s.rows_before else None)
+    c[1].metric("Columns", f"{s.columns_after}", delta=f"{s.columns_after - s.columns_before}" if s.columns_after != s.columns_before else None)
+    c[2].metric("Duplicates removed", f"{s.duplicates_removed:,}")
+    c[3].metric("Quarantined rows", f"{s.quarantined_rows:,}")
+    st.markdown("**Preprocessing summary**")
+    st.code("\n".join(s.to_lines()), language=None)
+    if s.dropped_columns:
+        st.markdown(f"**Dropped columns:** {', '.join(f'`{c}`' for c in s.dropped_columns)}")
+    if s.identifier_columns_excluded:
+        st.caption(f"Identifier / entity columns kept in the data but excluded from modelling: "
+                  f"{', '.join(f'`{c}`' for c in s.identifier_columns_excluded)}")
+    tabs = st.tabs(["Transformation log", "Quarantined rows", "Removed duplicates", "Preview"])
+    with tabs[0]:
+        audit = result.cleaning.audit.to_frame()
+        st.dataframe(audit[["operation", "reason", "records_modified", "records_removed"]] if len(audit) else audit,
+                    hide_index=True, width="stretch")
+    with tabs[1]:
+        q = result.cleaning.quarantine
+        st.dataframe(q, width="stretch") if len(q) else st.success("No rows quarantined")
+    with tabs[2]:
+        d = result.cleaning.removed_duplicates
+        st.dataframe(d, width="stretch") if len(d) else st.success("No duplicate rows removed")
+    with tabs[3]:
+        preview_cols = [c for c in result.cleaning.df.columns if not c.startswith("_")]
+        st.dataframe(result.cleaning.df[preview_cols].head(20), width="stretch")
+
+
 def page_placeholder(name: str):
     st.title(name)
     phase = PHASE_OF_PAGE[name]
     descriptions = {
-        "Quality Analysis": "Structural, numerical and categorical quality checks with a transparent score, and a basic "
-                            "preprocessing report (missing values, duplicates, invalid and non-finite values).",
         "Processing": "E0 raw, E1 quality processed and E2 feature engineered versions of the same rows, with a reproducible "
                       "subset size and a temporal split.",
         "Experiments": "Run E0, E1 and E2 with identical model settings, seed and split.",
@@ -432,6 +549,8 @@ def main():
             page_upload()
         elif page == "Profiling":
             page_profiling()
+        elif page == "Quality Analysis":
+            page_quality()
         elif page == "Model":
             page_model()
         else:
