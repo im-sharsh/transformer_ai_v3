@@ -30,10 +30,19 @@ def sinusoidal_positions(n: int, d: int) -> torch.Tensor:
 
 
 class SanityTransformerModel(nn.Module):
-    """token embedding + feature-position embedding + sinusoidal positional encoding -> encoder -> pooling -> head"""
+    """token embedding + feature-position embedding + sinusoidal positional encoding -> encoder -> pooling -> head
+
+    numeric_positions (audit R2 experiment, opt-in): sequence positions that carry a *continuous* numeric
+    value instead of (or in addition to, if the tokenizer's coarse_bins > 0) a token id. Each such position
+    gets its own learned (weight, bias) pair -- output = value * weight[feature] + bias[feature], the standard
+    per-feature affine numeric embedding (as opposed to a single embedding shared across all numeric columns,
+    which would force the same scaled value to mean the same thing regardless of which feature it came from).
+    None (the default) reproduces the original architecture exactly -- no numeric_weight/bias parameters are
+    created at all, so old checkpoints and behaviour are unaffected.
+    """
 
     def __init__(self, vocab_size: int, n_positions: int, d_model=64, n_heads=4, n_layers=2, dim_feedforward=128,
-                 dropout=0.1, pooling="cls"):
+                 dropout=0.1, pooling="cls", numeric_positions: list | None = None):
         super().__init__()
         self.pooling = pooling
         self.token = nn.Embedding(vocab_size, d_model, padding_idx=0)
@@ -44,9 +53,30 @@ class SanityTransformerModel(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.head = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout), nn.Linear(d_model, 1))
 
-    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        self.has_continuous_numeric = bool(numeric_positions)
+        if self.has_continuous_numeric:
+            k = len(numeric_positions)
+            self.numeric_weight = nn.Parameter(torch.randn(k, d_model) * 0.02)
+            self.numeric_bias = nn.Parameter(torch.zeros(k, d_model))
+            pos_index = torch.full((n_positions,), -1, dtype=torch.long)
+            for i, p in enumerate(numeric_positions):
+                pos_index[p] = i
+            self.register_buffer("numeric_pos_index", pos_index, persistent=False)
+
+    def forward(self, ids: torch.Tensor, numeric_values: torch.Tensor | None = None,
+               numeric_mask: torch.Tensor | None = None) -> torch.Tensor:
         positions = torch.arange(ids.shape[1], device=ids.device)
         h = self.token(ids) + self.feature_position(positions) + self.positional[: ids.shape[1]]
+        if self.has_continuous_numeric:
+            if numeric_values is None or numeric_mask is None:
+                raise ValueError("this model was built with numeric_positions set: forward() needs "
+                                 "numeric_values and numeric_mask (see TabularTokenizer.transform_numeric)")
+            idx = self.numeric_pos_index.clamp(min=0)                    # (L,)
+            w = self.numeric_weight[idx]                                 # (L, D)
+            b = self.numeric_bias[idx]                                   # (L, D)
+            valid = (self.numeric_pos_index >= 0).to(h.dtype)             # (L,) 1.0 at numeric positions
+            gate = (valid.unsqueeze(0) * numeric_mask).unsqueeze(-1)      # (B, L, 1)
+            h = h + (numeric_values.unsqueeze(-1) * w.unsqueeze(0) + b.unsqueeze(0)) * gate
         h = self.encoder(h)
         pooled = h[:, 0] if self.pooling == "cls" else h[:, 1:].mean(dim=1)
         return self.head(self.norm(pooled)).squeeze(-1)
@@ -71,19 +101,35 @@ class SanityTransformerAdapter(ModelAdapter):
                 **{k: self.mcfg[k] for k in ["d_model", "n_heads", "n_layers", "pooling"]}}
 
     def _build(self, prepared):
-        self.tokenizer = TabularTokenizer(self.rcfg["numeric_bins"], self.rcfg["min_category_count"]).fit(
+        numeric_mode = self.rcfg.get("numeric_mode", "quantile_bin")
+        coarse_bins = self.rcfg.get("numeric_coarse_bins", 0)
+        self.tokenizer = TabularTokenizer(self.rcfg["numeric_bins"], self.rcfg["min_category_count"],
+                                          numeric_mode=numeric_mode, coarse_bins=coarse_bins).fit(
             prepared.frames["train"], prepared.numeric, prepared.categorical)
         m = self.mcfg
+        numeric_positions = self.tokenizer.numeric_positions if numeric_mode == "continuous" else None
         self.model = SanityTransformerModel(self.tokenizer.vocab_size, self.tokenizer.n_positions, m["d_model"], m["n_heads"],
-                                            m["n_layers"], m["dim_feedforward"], m["dropout"], m["pooling"]).to(self.device)
+                                            m["n_layers"], m["dim_feedforward"], m["dropout"], m["pooling"],
+                                            numeric_positions=numeric_positions).to(self.device)
+
+    def _numeric_tensors(self, frame: pd.DataFrame):
+        """(values, mask) tensors if the tokenizer is in continuous mode, else (None, None)."""
+        if self.tokenizer.numeric_mode != "continuous":
+            return None, None
+        values, mask = self.tokenizer.transform_numeric(frame)
+        return torch.from_numpy(values), torch.from_numpy(mask)
 
     @torch.no_grad()
     def predict(self, frame: pd.DataFrame, batch_size: int = 1024) -> np.ndarray:
         self.model.eval()
         ids = torch.from_numpy(self.tokenizer.transform(frame))
+        nv, nm = self._numeric_tensors(frame)
         out = []
         for i in range(0, len(ids), batch_size):
-            out.append(torch.sigmoid(self.model(ids[i:i + batch_size].to(self.device))).double().cpu().numpy())
+            kwargs = {}
+            if nv is not None:
+                kwargs = {"numeric_values": nv[i:i + batch_size].to(self.device), "numeric_mask": nm[i:i + batch_size].to(self.device)}
+            out.append(torch.sigmoid(self.model(ids[i:i + batch_size].to(self.device), **kwargs)).double().cpu().numpy())
         return np.concatenate(out) if out else np.array([])
 
     def train(self, prepared, settings: dict, progress=None) -> dict:
@@ -97,6 +143,7 @@ class SanityTransformerAdapter(ModelAdapter):
         self._build(prepared)
         train, val = prepared.frames["train"], prepared.frames["validation"]
         x = torch.from_numpy(self.tokenizer.transform(train))
+        x_nv, x_nm = self._numeric_tensors(train)
         y = torch.tensor(train["_target"].to_numpy(dtype="float32"))
         opt = torch.optim.AdamW(self.model.parameters(), lr=float(s["learning_rate"]), weight_decay=0.01)
         # Audit finding 4: the sampler oversamples the positive class (sampling.train_positive_share, e.g. 10%
@@ -124,7 +171,10 @@ class SanityTransformerAdapter(ModelAdapter):
             total, n = 0.0, 0
             for i in range(0, len(x), int(s["batch_size"])):
                 idx = perm[i:i + int(s["batch_size"])]
-                logits = self.model(x[idx].to(self.device))
+                kwargs = {}
+                if x_nv is not None:
+                    kwargs = {"numeric_values": x_nv[idx].to(self.device), "numeric_mask": x_nm[idx].to(self.device)}
+                logits = self.model(x[idx].to(self.device), **kwargs)
                 losses = loss_fn(logits, y[idx].to(self.device))
                 if sample_weight is not None:
                     w = sample_weight[idx].to(self.device)
@@ -187,7 +237,9 @@ class SanityTransformerAdapter(ModelAdapter):
         checks.append(check("Token ids in range", bool(all_ids.min() >= 0 and all_ids.max() < self.tokenizer.vocab_size)))
         try:
             with torch.no_grad():
-                out = self.model(torch.from_numpy(enc["train"][:64]).to(self.device))
+                nv, nm = self._numeric_tensors(prepared.frames["train"].iloc[:64])
+                kwargs = {"numeric_values": nv.to(self.device), "numeric_mask": nm.to(self.device)} if nv is not None else {}
+                out = self.model(torch.from_numpy(enc["train"][:64]).to(self.device), **kwargs)
             checks.append(check("Forward pass successful", bool(torch.isfinite(out).all()), f"output shape {tuple(out.shape)}"))
         except Exception as e:
             return checks + [check("Forward pass successful", False, str(e))]
@@ -220,7 +272,9 @@ class SanityTransformerAdapter(ModelAdapter):
         self.mcfg, self.threshold = meta["model_config"], meta["threshold"]
         self.tokenizer = TabularTokenizer.from_dict(json.loads((path / "tokenizer.json").read_text()))
         m = self.mcfg
+        numeric_positions = self.tokenizer.numeric_positions if self.tokenizer.numeric_mode == "continuous" else None
         self.model = SanityTransformerModel(self.tokenizer.vocab_size, self.tokenizer.n_positions, m["d_model"], m["n_heads"],
-                                            m["n_layers"], m["dim_feedforward"], m["dropout"], m["pooling"]).to(self.device)
+                                            m["n_layers"], m["dim_feedforward"], m["dropout"], m["pooling"],
+                                            numeric_positions=numeric_positions).to(self.device)
         self.model.load_state_dict(torch.load(path / "model.pt", map_location=self.device))
         return self

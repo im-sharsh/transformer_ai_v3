@@ -84,9 +84,19 @@ leakage:                   # Phase 4: feature-level leakage scan on E1 / E2's fi
   holdout_fraction: 0.30    # only used as a fallback if the train/validation split boundary is unavailable
 
 representation:            # Phase 5: turns E0/E1/E2 features into token ids, the same way for every level
-  numeric_bins: 16          # quantile bins per numeric feature, fitted on training rows
+  numeric_bins: 16          # quantile bins per numeric feature, fitted on training rows (numeric_mode=quantile_bin)
   min_category_count: 5     # categorical values seen fewer times than this in training become "unknown"
   max_tokens: 256           # Phase 7: prompt length budget for the language-model backends (text representation)
+  numeric_mode: quantile_bin  # audit R2/R3 experiment: "quantile_bin" (default, unchanged since Phase 5) discards
+                              # numeric magnitude, keeping only rank (see levels.py's finding-1 comment for why
+                              # this was already a problem for the duplicated-column case). "continuous" keeps
+                              # the standardized value and learns a per-feature (weight, bias) embedding for it
+                              # instead of a lookup table. NOT yet measured against quantile_bin — do the same
+                              # 3-seed comparison done for findings 4/5 before ever changing this default; the
+                              # class_weighting revert in this file's history is exactly the cautionary tale.
+  numeric_coarse_bins: 0      # only used when numeric_mode: continuous. >0 (e.g. 4) additionally gives each
+                              # numeric feature a coarse quantile-bin token alongside its continuous value (the
+                              # brief's Representation D); 0 is pure continuous (Representation B/R2).
 
 models:
   sanity_transformer:       # Phase 5: built-in small Transformer (CPU-friendly; not meant to be state of the art)
