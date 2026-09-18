@@ -303,11 +303,16 @@ history that produced this session's commits, not duplicated here. What's left f
    including R3's severe, unexplained instability on E1 in one configuration. **Still open:** why R3+clip
    collapsed on E1 (0.358 ± 0.304); whether a per-feature clip threshold (rather than one global value) does
    better than the single global `5.0` used here.
-2. **T1 — feed cyclical features continuously.** **Toggle implemented and tested this session**
-   (`representation.continuous_features`, a per-column override independent of `numeric_mode`, isolating
-   cyclical features from the R2/E2 outlier confound in item 1). Config example:
-   `continuous_features: [hour_sin, hour_cos, day_of_week_sin, day_of_week_cos]`. **Not yet measured** —
-   whether it actually helps E2's cyclical features once isolated is still an open question.
+2. **~~T1 — feed cyclical features continuously~~ — implemented, tested, and measured this session.**
+   `representation.continuous_features` (a per-column override independent of `numeric_mode`) isolates
+   cyclical features from the R2/E2 outlier confound in item 1. Measured (E2, 3 seeds,
+   `continuous_features: [hour_sin, hour_cos, day_of_week_sin, day_of_week_cos]` vs the `quantile_bin`
+   baseline): **PR-AUC 0.861 → 0.833, F1 0.860 → 0.725 — a small regression, not the hoped-for improvement.**
+   The theoretical argument (quantile-binning breaks a cyclical value's smooth wraparound) may still be sound
+   in principle, but it does not survive contact with this data/model: plausibly because the already-present
+   discrete `hour`/`day_of_week` bins give this small model, trained for only 10 epochs, everything it needs
+   from time of day already, making the continuous `sin`/`cos` versions redundant rather than additive. Left
+   off by default (`continuous_features: []`); this is a negative result, not a recommendation to enable it.
 3. **~~S1 — extend finding 5's fix to the text/LLM path~~ — verified this session, no gap found.**
    `text_builder.py` reads `prepared.numeric`/`prepared.categorical` generically, so it already inherited the
    `prevK_*` sequence features for free (confirmed empirically: rendered a real prompt with `prev1_amount`,
@@ -315,9 +320,8 @@ history that produced this session's commits, not duplicated here. What's left f
    — the 12 sequence fields are scattered as individual `key=value` tokens among ~30 unrelated fields, rather
    than grouped as a coherent block the way `format_previous_transactions()` (still unused) would render them.
    Not measured whether that rendering difference matters to a language model; deprioritized below item 4.
-4. **~~Add `class_weighting: pos_weight_natural`~~ — done this session, see the measured section below.**
-   Promising (better than `none` on E0), but only checked on one level with a baseline that itself showed
-   run-to-run variability — not yet a recommended default.
+4. **~~Add `class_weighting: pos_weight_natural`~~ — done this session; extended to E1/E2 as a follow-up
+   (see the measured section below).** Mixed across levels, not a clean win — not made a default.
 5. Once 1–4 land (or are explicitly deferred with a reason): re-run the full E0/E1/E2 comparison with
    whatever combination of `numeric_mode`/`numeric_clip`/`e0_add_time_epoch`/`class_weighting` settings this
    session's measurements actually support, not just the isolated per-finding checks done so far.
@@ -340,14 +344,28 @@ even though the `none` baseline itself showed some run-to-run variability — se
 | `sample_weight` (reverted default, kept for comparison) | 0.240 ± 0.202 | 0.837 | 0.280 |
 | **`pos_weight_natural`** | **0.587 ± 0.138** | **0.994** | **0.444** |
 
-A genuinely promising result — better mean, better ROC-AUC, better F1 than the current default — but **not
-yet made the default**, for two reasons: (1) only E0 was checked so far (not E1/E2, where `sample_weight`'s
-effect also varied by level); (2) the `none` baseline itself measured differently across two separate script
-executions with nominally identical settings (0.470 in the earlier finding-4 decomposition vs 0.513 here),
-which is a real reproducibility gap in the measurement methodology itself, not just noise in the treatment —
+A genuinely promising result on E0 — better mean, better ROC-AUC, better F1 than the current default — but
+this did **not** generalize to E1/E2 when checked as a follow-up (see below), for two reasons flagged at the
+time: (1) only E0 had been checked so far; (2) the `none` baseline itself measured differently across two
+separate script executions with nominally identical settings (0.470 in the earlier finding-4 decomposition vs
+0.513 here), a real reproducibility gap in the measurement methodology, not just noise in the treatment —
 worth investigating (possibly unseeded randomness somewhere in schema/role detection) before trusting any
-small-to-moderate effect size measured this way. A 3-seed, single-script, single-level check is informative,
-not sufficient, exactly the standard this whole session has tried to hold itself to.
+small-to-moderate effect size measured this way.
+
+### Extended to E1/E2 (follow-up measurement)
+
+| Level | `none` | `pos_weight_natural` |
+|---|---|---|
+| E0 | 0.513 ± 0.042 | **0.587 ± 0.138** (better mean, 3× the variance) |
+| E1 | 0.470 ± 0.031 | 0.385 ± 0.195 (**worse mean**, 6× the variance) |
+| E2 | 0.861 ± 0.033 | 0.867 ± 0.089 (roughly tied on PR-AUC, F1 dropped 0.860 → 0.809) |
+
+**Confirms the mixed pattern rather than the E0-only promise**: `pos_weight_natural` helps E0, clearly hurts
+E1, and is a wash on E2 with worse F1 and much higher variance everywhere. This is the same shape of result
+as `sample_weight`'s original (reverted) measurement and R2's E0/E1-vs-E2 split — **a config change that
+looks good on whichever single level you happened to check first, and doesn't hold up once you check the
+rest.** Not made a default. `class_weighting` stays `none`.
+
 6. **Run it on the real dataset** — still never done, unchanged from before this session.
 7. **~~Generalization test on a non-fraud dataset, through the full app~~ — done this session.**
    `test_generalization_full_app_flow_on_a_structurally_different_dataset` pushes the `churn` fixture (no
