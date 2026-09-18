@@ -56,7 +56,7 @@ continuously so their periodicity survives), S1 (extend finding 5's fix into the
 
 ## Tests completed (this session)
 
-`pytest` → **85 passed, 1 skipped** (was 67 passed, 1 skipped before this session; the skip is unchanged —
+`pytest` → **87 passed, 1 skipped** (was 67 passed, 1 skipped before this session; the skip is unchanged —
 no network access to the Hugging Face Hub in this environment). Run cold after every commit. Note: partway
 through this session the suite grew large enough that a single `pytest` invocation exceeds this sandbox's
 per-command time limit (~300s); from the R2/R3 work onward it was run **per test file** instead (still cold,
@@ -82,7 +82,7 @@ Per-file pass counts (this exact, freshly re-run breakdown): `test_ingestion.py`
 `test_backends.py` + `test_levels.py` + `test_experiment.py` + `test_app.py` → 72 passed, 1 skipped
 (re-verified: `test_app.py` alone → 8 passed, up from 7, after adding and fixing
 `test_generalization_full_app_flow_on_a_structurally_different_dataset`);
-`test_model.py` → 13 passed. **Total: 72 + 13 = 85 passed, 1 skipped.**
+`test_model.py` → 15 passed (was 13, +2 for T1's `continuous_features`). **Total: 72 + 15 = 87 passed, 1 skipped.**
 
 Commits this session, each with tests run (fully or per-file as above) before committing: `87d3547`
 (findings 1+5), `54d6cfe` (finding 4), `548b34e` (multi-seed harness), `30f7639` (class_weighting revert),
@@ -233,7 +233,7 @@ unavailable without a GPU. 68 tests.
 
 `pytest` → **68 passed** (unchanged from Phase 7 — no test or source files under `src/`/`tests/` were touched
 that session). Run cold, to confirm the documentation-only changes broke nothing. (For the audit session's
-current test count — 85 passed, 1 skipped, and it will keep growing — see "Tests completed (this session)"
+current test count — 87 passed, 1 skipped, and it will keep growing — see "Tests completed (this session)"
 near the top of this file.)
 
 `notebooks/colab_demo.ipynb` was executed end to end with `nbclient` (own verification method, not `pytest`) —
@@ -303,9 +303,11 @@ history that produced this session's commits, not duplicated here. What's left f
    including R3's severe, unexplained instability on E1 in one configuration. **Still open:** why R3+clip
    collapsed on E1 (0.358 ± 0.304); whether a per-feature clip threshold (rather than one global value) does
    better than the single global `5.0` used here.
-2. **T1 — feed cyclical features continuously**, now that the continuous path exists. Needs a per-feature,
-   not per-level, `numeric_mode` toggle — not yet implemented; currently all-or-nothing per level, so trying
-   this means either building that toggle or accepting E2's instability (item 1) as a confound.
+2. **T1 — feed cyclical features continuously.** **Toggle implemented and tested this session**
+   (`representation.continuous_features`, a per-column override independent of `numeric_mode`, isolating
+   cyclical features from the R2/E2 outlier confound in item 1). Config example:
+   `continuous_features: [hour_sin, hour_cos, day_of_week_sin, day_of_week_cos]`. **Not yet measured** —
+   whether it actually helps E2's cyclical features once isolated is still an open question.
 3. **~~S1 — extend finding 5's fix to the text/LLM path~~ — verified this session, no gap found.**
    `text_builder.py` reads `prepared.numeric`/`prepared.categorical` generically, so it already inherited the
    `prevK_*` sequence features for free (confirmed empirically: rendered a real prompt with `prev1_amount`,
@@ -382,8 +384,10 @@ not sufficient, exactly the standard this whole session has tried to hold itself
       `none`), not yet checked on E1/E2 or made a default; flagged a baseline-reproducibility gap worth
       investigating (the `none` measurement itself varied across two separate script runs).
 - [x] Generalization test on a non-fraud dataset through the full app — done, passing (see next-task item 7).
-- [ ] Audit: T1 (cyclical features continuous — needs a per-feature, not per-level, `numeric_mode` toggle,
-      not yet built); why R3+clip collapsed on E1 in one run (0.358 ± 0.304, unexplained); investigate the
-      `none`-baseline reproducibility gap just found; extend `pos_weight_natural` to E1/E2
+- [x] Audit: T1's `continuous_features` per-column toggle implemented and tested (not yet measured — see
+      next-task item 2)
+- [ ] Audit: T1's actual measurement (does it help E2's cyclical features once isolated); why R3+clip
+      collapsed on E1 in one run (0.358 ± 0.304, unexplained); investigate the `none`-baseline
+      reproducibility gap; extend `pos_weight_natural` to E1/E2
 - [ ] Beyond the 8 phases: run on the real dataset; multiclass/regression through Processing; the rest of
       section 23
