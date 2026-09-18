@@ -103,8 +103,10 @@ class SanityTransformerAdapter(ModelAdapter):
     def _build(self, prepared):
         numeric_mode = self.rcfg.get("numeric_mode", "quantile_bin")
         coarse_bins = self.rcfg.get("numeric_coarse_bins", 0)
+        numeric_clip = self.rcfg.get("numeric_clip")
         self.tokenizer = TabularTokenizer(self.rcfg["numeric_bins"], self.rcfg["min_category_count"],
-                                          numeric_mode=numeric_mode, coarse_bins=coarse_bins).fit(
+                                          numeric_mode=numeric_mode, coarse_bins=coarse_bins,
+                                          numeric_clip=numeric_clip).fit(
             prepared.frames["train"], prepared.numeric, prepared.categorical)
         m = self.mcfg
         numeric_positions = self.tokenizer.numeric_positions if numeric_mode == "continuous" else None

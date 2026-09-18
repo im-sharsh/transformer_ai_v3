@@ -103,6 +103,12 @@ representation:            # Phase 5: turns E0/E1/E2 features into token ids, th
   numeric_coarse_bins: 0      # only used when numeric_mode: continuous. >0 (e.g. 4) additionally gives each
                               # numeric feature a coarse quantile-bin token alongside its continuous value (the
                               # brief's Representation D); 0 is pure continuous (Representation B/R2).
+  numeric_clip: 5.0           # only used when numeric_mode: continuous. Clips standardized numeric values to
+                              # +/-this before they reach the model. Diagnosed necessary (audit session): some
+                              # engineered ratio/z-score features have standardized values up to |z|~30; a
+                              # handful of unclipped outliers measurably hurt both accuracy and seed-to-seed
+                              # stability on E2 (PR-AUC 0.861->0.674, std 0.033->0.158 with no clipping;
+                              # 0.674->0.838, std 0.158->0.055 with clip=5). null disables clipping.
 
 models:
   sanity_transformer:       # Phase 5: built-in small Transformer (CPU-friendly; not meant to be state of the art)

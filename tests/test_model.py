@@ -74,6 +74,25 @@ def test_continuous_mode_with_coarse_bins_keeps_both_signals():
     assert len(np.unique(values[:, 1])) > 4                     # but the continuous value still varies within each bin
 
 
+def test_continuous_mode_clips_extreme_standardized_values():
+    """Diagnosed cause of R2's E2 regression (audit session): a handful of engineered ratio/z-score features
+    have standardized values up to |z|~30; numeric_clip caps them before they reach the model."""
+    df = pd.DataFrame({"amt": np.concatenate([np.random.default_rng(0).normal(50, 10, 199), [100000.0]]),  # one wild outlier
+                       "cat": ["a", "b"] * 100})
+    tok = TabularTokenizer(16, 1, numeric_mode="continuous", numeric_clip=5.0)
+    tok.fit(df, ["amt"], ["cat"])
+    values, mask = tok.transform_numeric(df)
+    assert values[:, 1].max() == 5.0 and values[:, 1].min() >= -5.0
+    unclipped = TabularTokenizer(16, 1, numeric_mode="continuous", numeric_clip=None)
+    unclipped.fit(df, ["amt"], ["cat"])
+    uv, _ = unclipped.transform_numeric(df)
+    assert uv[:, 1].max() > 100, "the unclipped tokenizer must still show the raw extreme value for comparison"
+    restored = TabularTokenizer.from_dict(tok.to_dict())
+    assert restored.numeric_clip == 5.0
+    rv, _ = restored.transform_numeric(df)
+    np.testing.assert_allclose(rv, values)
+
+
 def test_sanity_transformer_learns_with_continuous_numeric_mode():
     """The full train/predict/save/load path must work end to end with numeric_mode='continuous', not just
     the tokenizer in isolation."""

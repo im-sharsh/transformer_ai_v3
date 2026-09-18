@@ -25,11 +25,18 @@ PAD, CLS = 0, 1
 
 class TabularTokenizer:
     def __init__(self, numeric_bins: int = 16, min_category_count: int = 5, numeric_mode: str = "quantile_bin",
-                coarse_bins: int = 0):
+                coarse_bins: int = 0, numeric_clip: float | None = None):
         if numeric_mode not in ("quantile_bin", "continuous"):
             raise ValueError(f"numeric_mode must be 'quantile_bin' or 'continuous', got {numeric_mode!r}")
         self.numeric_bins, self.min_count = numeric_bins, min_category_count
         self.numeric_mode, self.coarse_bins = numeric_mode, int(coarse_bins)
+        # Diagnosed empirically (audit session, R2 vs quantile_bin on E2): several engineered ratio/z-score-style
+        # features (e.g. card_amount_ratio_to_mean, card_amount_zscore) have standardized values up to |z|~30 --
+        # a handful of extreme, unclipped outliers feeding directly into the linear numeric embedding measurably
+        # hurt both accuracy and seed-to-seed stability (E2 PR-AUC 0.861->0.674, std 0.033->0.158). Clipping to
+        # +/-5 recovered most of the gap (0.674->0.838) and cut the variance back down (0.158->0.055). None
+        # (the default) means no clipping, matching this feature's behaviour before the diagnosis.
+        self.numeric_clip = numeric_clip
         self.numeric, self.categorical = [], []
         self.edges: dict = {}
         self.vocab: dict = {}          # feature -> {value_or_bin: token}
@@ -113,13 +120,15 @@ class TabularTokenizer:
             good = np.isfinite(x)
             stats = self.numeric_stats[c]
             standardized = (x - stats["median"]) / stats["scale"]
+            if self.numeric_clip is not None:
+                standardized = np.clip(standardized, -self.numeric_clip, self.numeric_clip)
             values[:, j] = np.where(good, standardized, 0.0).astype(np.float32)
             mask[:, j] = good.astype(np.float32)
         return values, mask
 
     def to_dict(self) -> dict:
         return {"numeric_bins": self.numeric_bins, "min_category_count": self.min_count,
-                "numeric_mode": self.numeric_mode, "coarse_bins": self.coarse_bins,
+                "numeric_mode": self.numeric_mode, "coarse_bins": self.coarse_bins, "numeric_clip": self.numeric_clip,
                 "numeric": self.numeric, "categorical": self.categorical,
                 "edges": {c: e.tolist() for c, e in self.edges.items()},
                 "vocab": {c: {str(k): v for k, v in m.items()} for c, m in self.vocab.items()},
@@ -128,7 +137,7 @@ class TabularTokenizer:
     @classmethod
     def from_dict(cls, d: dict) -> "TabularTokenizer":
         tok = cls(d["numeric_bins"], d["min_category_count"], d.get("numeric_mode", "quantile_bin"),
-                  d.get("coarse_bins", 0))
+                  d.get("coarse_bins", 0), d.get("numeric_clip"))
         tok.numeric, tok.categorical, tok.special, tok.vocab_size = d["numeric"], d["categorical"], d["special"], d["vocab_size"]
         tok.numeric_stats = d.get("numeric_stats", {})
         tok.edges = {c: np.array(e) for c, e in d["edges"].items()}

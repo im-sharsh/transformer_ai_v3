@@ -56,7 +56,7 @@ continuously so their periodicity survives), S1 (extend finding 5's fix into the
 
 ## Tests completed (this session)
 
-`pytest` → **82 passed, 1 skipped** (was 67 passed, 1 skipped before this session; the skip is unchanged —
+`pytest` → **83 passed, 1 skipped** (was 67 passed, 1 skipped before this session; the skip is unchanged —
 no network access to the Hugging Face Hub in this environment). Run cold after every commit. Note: partway
 through this session the suite grew large enough that a single `pytest` invocation exceeds this sandbox's
 per-command time limit (~300s); from the R2/R3 work onward it was run **per test file** instead (still cold,
@@ -79,8 +79,8 @@ as the default, before it was measured and reverted).
 
 Per-file pass counts (this exact, freshly re-run breakdown): `test_ingestion.py` + `test_roles.py` +
 `test_profiling.py` + `test_config_hardware.py` + `test_quality.py` + `test_basic_preprocessing.py` +
-`test_backends.py` → 34 passed, 1 skipped; `test_levels.py` + `test_experiment.py` → 30 passed (22 + 8);
-`test_model.py` → 11 passed; `test_app.py` → 7 passed. **Total: 34 + 30 + 11 + 7 = 82 passed, 1 skipped.**
+`test_backends.py` + `test_levels.py` + `test_experiment.py` → 64 passed, 1 skipped;
+`test_model.py` → 12 passed; `test_app.py` → 7 passed. **Total: 64 + 12 + 7 = 83 passed, 1 skipped.**
 
 Commits this session, each with tests run (fully or per-file as above) before committing: `87d3547`
 (findings 1+5), `54d6cfe` (finding 4), `548b34e` (multi-seed harness), `30f7639` (class_weighting revert),
@@ -143,13 +143,27 @@ Measured (E0/E1/E2, 3 seeds):
 A genuinely mixed, level-dependent result, reported as such rather than cherry-picked: R2 clearly helps E0/E1
 but clearly hurts E2 (both mean and 5x the variance) — E2 has ~20+ numeric-ish positions (time, history
 aggregates, sequence features) and a shared-architecture continuous embedding across that many heterogeneous
-signals may be harder for this tiny model to fit than discrete bins are; not yet diagnosed further. R3 looks
-like the best compromise (matches or beats `quantile_bin` on all three levels, variance back to normal), but
-this is 3 seeds on one synthetic dataset — the same strength of evidence that misled the `class_weighting`
-default before it was corrected. **`numeric_mode` stays `quantile_bin` in config; nothing here should be read
-as "R3 is now recommended."**
+signals may be harder for this tiny model to fit than discrete bins are. **Diagnosed** (this session,
+continued): E2-specific engineered ratio/z-score features (`card_amount_ratio_to_mean`, `card_amount_zscore`,
+`card_amount_sum_24h`, `prev1/2/3_amount`, …) have standardized values up to |z|≈30 under train-fit median/IQR
+scaling — a handful of unclipped outliers feeding straight into the linear numeric embedding. Added
+`representation.numeric_clip` (default `5.0`, only active when `numeric_mode: continuous`) to cap this.
 
-**C1 — E0's timestamp fix** (`data.e0_add_time_epoch`, `src/preprocessing/levels.py`). Opt-in, default `false`.
+Re-measured (3 seeds, real code — not the diagnostic monkeypatch used to find this):
+
+| Level | quantile_bin (default) | continuous, no clip | continuous, clip=5 | continuous + coarse bin, clip=5 |
+|---|---|---|---|---|
+| E0 | 0.513 ± 0.042 | **0.620 ± 0.038** | 0.591 ± 0.032 | 0.547 ± 0.066 |
+| E1 | 0.470 ± 0.031 | **0.620 ± 0.035** | 0.603 ± 0.027 | 0.358 ± 0.304 (!) |
+| E2 | 0.861 ± 0.033 | 0.674 ± 0.158 | 0.838 ± 0.055 | **0.860 ± 0.012** |
+
+Clipping confirms the diagnosis (E2 recovers most of the way, variance back near baseline) but is **not a
+clean, uniform win**: it slightly *reduces* R2's gain on E0/E1 (clipping discards some of the real signal
+that helped there, since E0/E1 don't have E2's extreme-outlier columns), and combining it with coarse bins
+(R3) produced a severe, unstable collapse on E1 in this run (0.358 ± 0.304 — one seed likely failed badly;
+not further diagnosed). **This is exactly the same lesson as `class_weighting`, repeating**: a config
+combination that looks good on the metric you're focused on (E2) can hide instability elsewhere in the
+matrix. No default changed. `numeric_mode` stays `quantile_bin`.**C1 — E0's timestamp fix** (`data.e0_add_time_epoch`, `src/preprocessing/levels.py`). Opt-in, default `false`.
 Adds a numeric epoch-seconds column to E0 alongside the unchanged raw timestamp string, closing the ~100%
 "unknown"-token gap finding 3 measured. Measured effect on E0 alone: PR-AUC 0.513 ± 0.042 (off) vs
 0.523 ± 0.032 (on) — barely inside the noise band, not the clear win R2 gave. Plausible explanation, not yet
@@ -217,7 +231,7 @@ unavailable without a GPU. 68 tests.
 
 `pytest` → **68 passed** (unchanged from Phase 7 — no test or source files under `src/`/`tests/` were touched
 that session). Run cold, to confirm the documentation-only changes broke nothing. (For the audit session's
-current test count — 82 passed, 1 skipped, and it will keep growing — see "Tests completed (this session)"
+current test count — 83 passed, 1 skipped, and it will keep growing — see "Tests completed (this session)"
 near the top of this file.)
 
 `notebooks/colab_demo.ipynb` was executed end to end with `nbclient` (own verification method, not `pytest`) —
@@ -281,27 +295,28 @@ Everything listed in each phase's own section above still applies. Additions fro
 Full audit (architecture trace, 6 verified findings, prioritized experiment matrix) is in the conversation
 history that produced this session's commits, not duplicated here. What's left from it:
 
-1. **Diagnose why R2 (continuous numeric) hurts E2 specifically** (measured above: PR-AUC 0.861 → 0.674,
-   std 0.033 → 0.158) before trusting R3 as a fix rather than a lucky combination. Candidates worth checking
-   before anything else: does a higher learning rate or more epochs stabilize R2 on E2 alone (i.e. is it an
-   optimization problem, not a representational one)? Does restricting continuous mode to only the "core"
-   numeric columns (not history/sequence features) close the gap?
-2. **T1 — feed cyclical features continuously**, now that the continuous path exists (item 3 from the
-   previous version of this list is partly unblocked). Try `numeric_mode: continuous` restricted to just
-   `hour_sin`/`hour_cos`/`day_of_week_sin`/`day_of_week_cos` (a per-feature, not per-level, toggle would be
-   needed — not yet implemented; `numeric_mode` is currently all-or-nothing per level).
-3. **S1 — extend finding 5's fix to the text/LLM path.** `text_builder.py` (feeds Hugging Face/Nemotron/API
-   adapters) reads `prepared.numeric`/`prepared.categorical`, the same lists `levels.py`'s E2 now includes
-   `prevK_*` sequence features in — so it likely already inherited the fix for free. **Verify this rather
-   than assume** (nothing in this session touched or tested `text_builder.py`), then consider
-   `format_previous_transactions()`'s purpose-built text rendering as an alternative to the plain
-   field-by-field rendering `text_builder.py` currently does for every column indiscriminately.
+1. **~~Diagnose why R2 hurts E2~~ — done this session.** Cause: unclipped outlier standardized values
+   (|z|≈30) in engineered ratio/z-score features. `representation.numeric_clip` (default `5.0`, only active
+   under `numeric_mode: continuous`) fixes E2 but is not a uniform win — see the measured table above,
+   including R3's severe, unexplained instability on E1 in one configuration. **Still open:** why R3+clip
+   collapsed on E1 (0.358 ± 0.304); whether a per-feature clip threshold (rather than one global value) does
+   better than the single global `5.0` used here.
+2. **T1 — feed cyclical features continuously**, now that the continuous path exists. Needs a per-feature,
+   not per-level, `numeric_mode` toggle — not yet implemented; currently all-or-nothing per level, so trying
+   this means either building that toggle or accepting E2's instability (item 1) as a confound.
+3. **~~S1 — extend finding 5's fix to the text/LLM path~~ — verified this session, no gap found.**
+   `text_builder.py` reads `prepared.numeric`/`prepared.categorical` generically, so it already inherited the
+   `prevK_*` sequence features for free (confirmed empirically: rendered a real prompt with `prev1_amount`,
+   `prev1_category`, etc. present). The remaining question is representation *quality*, not data availability
+   — the 12 sequence fields are scattered as individual `key=value` tokens among ~30 unrelated fields, rather
+   than grouped as a coherent block the way `format_previous_transactions()` (still unused) would render them.
+   Not measured whether that rendering difference matters to a language model; deprioritized below item 4.
 4. Add `class_weighting: pos_weight_natural` (§12's Experiment 4: natural sampling + `pos_weight`, as opposed
    to this session's oversampling + sample-weight fix, which regressed) as a second, directly comparable
    option, and measure it the same way before considering it for anything but comparison.
 5. Once 1–4 land (or are explicitly deferred with a reason): re-run the full E0/E1/E2 comparison with
-   whatever combination of `numeric_mode`/`e0_add_time_epoch`/`class_weighting` settings this session's
-   measurements actually support, not just the isolated per-finding checks done so far.
+   whatever combination of `numeric_mode`/`numeric_clip`/`e0_add_time_epoch`/`class_weighting` settings this
+   session's measurements actually support, not just the isolated per-finding checks done so far.
 6. **Run it on the real dataset** — still never done, unchanged from before this session.
 7. **Generalization test on a non-fraud dataset**, through the *full app*, not just the `churn` fixture unit
    tests that already exist.
@@ -321,10 +336,13 @@ history that produced this session's commits, not duplicated here. What's left f
 - [x] Audit: findings 1, 4, 5 fixed (redundant numeric triple, unweighted loss under oversampling, dead
       sequence-feature code); multi-seed comparison harness added
 - [x] Audit: R2/R3 (continuous numeric representation) and C1 (E0 timestamp fix) implemented, tested and
-      measured — both opt-in, neither defaulted on; R2 helps E0/E1 and hurts E2 (undiagnosed), C1 barely
-      moves E0's own number. Finding 2/3's other half (cyclical features under quantile_bin) still open.
-- [ ] Audit: T1 (cyclical features continuous, needs a per-feature not per-level numeric_mode toggle);
-      S1 (verify/extend finding 5 to the text/LLM path, `text_builder.py` — untouched this session);
-      diagnose why R2 regresses E2 before trusting R3's apparent fix
+      measured — both opt-in, neither defaulted on; R2 helps E0/E1 and hurt E2 until diagnosed (unclipped
+      outlier values; `numeric_clip` fixes E2 but isn't a uniform win across levels), C1 barely moves E0's
+      own number.
+- [x] Audit: S1 verified — `text_builder.py` already inherits finding 5's sequence features for free (no
+      code gap); remaining question is text-rendering quality, not data availability, and is deprioritized.
+- [ ] Audit: T1 (cyclical features continuous — needs a per-feature, not per-level, `numeric_mode` toggle,
+      not yet built); why R3+clip collapsed on E1 in one run (0.358 ± 0.304, unexplained);
+      `class_weighting: pos_weight_natural` as a second, measured comparison option
 - [ ] Beyond the 8 phases: run on the real dataset; generalization test on a non-fraud dataset through the full
       app; multiclass/regression through Processing; the rest of section 23
