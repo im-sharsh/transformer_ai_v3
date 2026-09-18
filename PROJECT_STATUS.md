@@ -56,7 +56,7 @@ continuously so their periodicity survives), S1 (extend finding 5's fix into the
 
 ## Tests completed (this session)
 
-`pytest` → **84 passed, 1 skipped** (was 67 passed, 1 skipped before this session; the skip is unchanged —
+`pytest` → **85 passed, 1 skipped** (was 67 passed, 1 skipped before this session; the skip is unchanged —
 no network access to the Hugging Face Hub in this environment). Run cold after every commit. Note: partway
 through this session the suite grew large enough that a single `pytest` invocation exceeds this sandbox's
 per-command time limit (~300s); from the R2/R3 work onward it was run **per test file** instead (still cold,
@@ -79,8 +79,10 @@ as the default, before it was measured and reverted).
 
 Per-file pass counts (this exact, freshly re-run breakdown): `test_ingestion.py` + `test_roles.py` +
 `test_profiling.py` + `test_config_hardware.py` + `test_quality.py` + `test_basic_preprocessing.py` +
-`test_backends.py` + `test_levels.py` + `test_experiment.py` + `test_app.py` → 71 passed, 1 skipped;
-`test_model.py` → 13 passed. **Total: 71 + 13 = 84 passed, 1 skipped.**
+`test_backends.py` + `test_levels.py` + `test_experiment.py` + `test_app.py` → 72 passed, 1 skipped
+(re-verified: `test_app.py` alone → 8 passed, up from 7, after adding and fixing
+`test_generalization_full_app_flow_on_a_structurally_different_dataset`);
+`test_model.py` → 13 passed. **Total: 72 + 13 = 85 passed, 1 skipped.**
 
 Commits this session, each with tests run (fully or per-file as above) before committing: `87d3547`
 (findings 1+5), `54d6cfe` (finding 4), `548b34e` (multi-seed harness), `30f7639` (class_weighting revert),
@@ -231,7 +233,7 @@ unavailable without a GPU. 68 tests.
 
 `pytest` → **68 passed** (unchanged from Phase 7 — no test or source files under `src/`/`tests/` were touched
 that session). Run cold, to confirm the documentation-only changes broke nothing. (For the audit session's
-current test count — 84 passed, 1 skipped, and it will keep growing — see "Tests completed (this session)"
+current test count — 85 passed, 1 skipped, and it will keep growing — see "Tests completed (this session)"
 near the top of this file.)
 
 `notebooks/colab_demo.ipynb` was executed end to end with `nbclient` (own verification method, not `pytest`) —
@@ -345,8 +347,16 @@ worth investigating (possibly unseeded randomness somewhere in schema/role detec
 small-to-moderate effect size measured this way. A 3-seed, single-script, single-level check is informative,
 not sufficient, exactly the standard this whole session has tried to hold itself to.
 6. **Run it on the real dataset** — still never done, unchanged from before this session.
-7. **Generalization test on a non-fraud dataset**, through the *full app*, not just the `churn` fixture unit
-   tests that already exist.
+7. **~~Generalization test on a non-fraud dataset, through the full app~~ — done this session.**
+   `test_generalization_full_app_flow_on_a_structurally_different_dataset` pushes the `churn` fixture (no
+   entity column, string dates, yes/no target) through the real Streamlit app end to end — upload, schema
+   detection, quality, basic preprocessing, Processing's split/sample, all three E0/E1/E2 levels via
+   Experiments, back to the Dashboard — not just unit-level `DataPreparer` calls. Confirms: role detection is
+   correct without any override (target=`churn`, task=binary classification, entity=`None` since
+   `customer_id` is unique per row, datetime=`signup_date`); E2 gracefully skips history/sequence features
+   with no entity column rather than crashing or silently assuming one exists; every metric stays in a valid
+   range across all three levels. Passed on the first real run after fixing one bug in the test itself
+   (see "Tests completed" below).
 8. Multiclass / regression through Processing; `_pending/src/preprocessing/outliers.py`; section 23's other
    items — unchanged from before this session, still deliberately deferred.
 
@@ -371,8 +381,9 @@ not sufficient, exactly the standard this whole session has tried to hold itself
 - [x] Audit: `class_weighting: pos_weight_natural` implemented and measured — promising on E0 (better than
       `none`), not yet checked on E1/E2 or made a default; flagged a baseline-reproducibility gap worth
       investigating (the `none` measurement itself varied across two separate script runs).
+- [x] Generalization test on a non-fraud dataset through the full app — done, passing (see next-task item 7).
 - [ ] Audit: T1 (cyclical features continuous — needs a per-feature, not per-level, `numeric_mode` toggle,
       not yet built); why R3+clip collapsed on E1 in one run (0.358 ± 0.304, unexplained); investigate the
       `none`-baseline reproducibility gap just found; extend `pos_weight_natural` to E1/E2
-- [ ] Beyond the 8 phases: run on the real dataset; generalization test on a non-fraud dataset through the full
-      app; multiclass/regression through Processing; the rest of section 23
+- [ ] Beyond the 8 phases: run on the real dataset; multiclass/regression through Processing; the rest of
+      section 23
