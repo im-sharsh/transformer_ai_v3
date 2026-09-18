@@ -255,15 +255,12 @@ python -c "import nbformat; from nbclient import NotebookClient; ..."  # execute
 
 ## Current git commit
 
-The commit titled "Document R2/R3 and finding-3 (C1) measurements in PROJECT_STATUS.md …" (run
-`git log --oneline -1` for its exact hash; amending this file changes the hash, so it is intentionally not
-pinned here). Commits this session, in order: "Audit fixes 1/2: …" (findings 1+5), "Audit fix 3/4: …"
-(finding 4), "Audit fix 4/4: …" (multi-seed harness), "Update PROJECT_STATUS.md: document audit findings…",
-"Revert class_weighting default to 'none': measured regression, not assumed benefit", "Document the measured
-class_weighting revert…", "Audit R2/R3: continuous numeric representation…", "Audit C1: opt-in numeric epoch
-for E0…" — each with the full suite passing before committing. The suite is now large enough that a single
-`pytest` invocation exceeds this environment's per-command time limit; run per test file (see "Tests
-completed" above for the exact breakdown) rather than assuming a single `pytest` call will finish.
+The commit titled "Measure T1 and extend pos_weight_natural to E1/E2 …" (run `git log --oneline -1` for its
+exact hash; amending this file changes the hash, so it is intentionally not pinned here). 16 commits so far
+this session (`git log --oneline` shows all of them, newest first); each committed only after its own tests
+passed. Full suite generally run per test file rather than as one `pytest` invocation, since the suite is now
+large enough (87 tests) that a single cold run sometimes exceeds this environment's per-command time limit —
+though a single-invocation cold run did succeed at least once (see "Tests completed" above).
 
 ## Known issues
 
@@ -295,7 +292,9 @@ Everything listed in each phase's own section above still applies. Additions fro
 ## Next task (continuing the audit's recommended order)
 
 Full audit (architecture trace, 6 verified findings, prioritized experiment matrix) is in the conversation
-history that produced this session's commits, not duplicated here. What's left from it:
+history that produced this session's commits, not duplicated here. Items 1–4 below are all now done and
+measured; what's genuinely still open is item 5 onward (a full combined re-run) plus the loose threads each
+item's own measurement surfaced (see each item):
 
 1. **~~Diagnose why R2 hurts E2~~ — done this session.** Cause: unclipped outlier standardized values
    (|z|≈30) in engineered ratio/z-score features. `representation.numeric_clip` (default `5.0`, only active
