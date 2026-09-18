@@ -77,6 +77,26 @@ def test_e0_keeps_raw_values_and_the_shared_exclusion_policy(transactions):
     row_id = train["_row_id"].iloc[0]
     idx = int(row_id[1:])
     assert train.loc[train["_row_id"] == row_id, "amt"].iloc[0] == original.loc[idx, "amt"]
+    assert "trans_date_trans_time__epoch" not in e0.features, "off by default until measured (audit finding 3)"
+
+
+def test_e0_time_epoch_is_opt_in_and_does_not_replace_the_raw_string(transactions):
+    """Audit finding 3 fix (C1): with data.e0_add_time_epoch on, E0 gains a real, usable time signal without
+    E0 stopping to mean 'minimally processed' -- the raw string stays, unchanged, alongside it."""
+    ps, roles = _prepare(transactions, "tx")
+    lr = infer_roles(transactions, ps, roles)
+    cfg = {**CFG, "data": {**CFG["data"], "e0_add_time_epoch": True}}
+    dp = DataPreparer(transactions, ps, lr, cfg, rows=1000, seed=42)
+    dp.prepare_split()
+    e0 = dp.build("E0")
+    epoch_col = "trans_date_trans_time__epoch"
+    assert epoch_col in e0.numeric
+    assert "trans_date_trans_time" in e0.categorical, "the raw string is unchanged, not replaced"
+    train = e0.frames["train"]
+    expected = pd.to_datetime(train["trans_date_trans_time"])
+    expected_epoch = (expected - pd.Timestamp("1970-01-01")).dt.total_seconds()
+    np.testing.assert_allclose(train[epoch_col].to_numpy(), expected_epoch.to_numpy())
+    assert any("e0_add_time_epoch is on" in s for s in e0.info["steps"])
 
 
 def test_e1_transforms_numeric_features_instead_of_using_raw_values(transactions):

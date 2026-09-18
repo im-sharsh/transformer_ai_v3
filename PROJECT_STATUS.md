@@ -56,23 +56,35 @@ continuously so their periodicity survives), S1 (extend finding 5's fix into the
 
 ## Tests completed (this session)
 
-`pytest` → **77 passed, 1 skipped** (was 67 passed, 1 skipped before this session; the skip is unchanged —
-no network access to the Hugging Face Hub in this environment). Run cold after every one of the four commits
-below, not just once at the end.
+`pytest` → **82 passed, 1 skipped** (was 67 passed, 1 skipped before this session; the skip is unchanged —
+no network access to the Hugging Face Hub in this environment). Run cold after every commit. Note: partway
+through this session the suite grew large enough that a single `pytest` invocation exceeds this sandbox's
+per-command time limit (~300s); from the R2/R3 work onward it was run **per test file** instead (still cold,
+still every file, just not one combined process) — see each file's pass count below.
 
-12 new tests: `test_e1_numeric_representation_is_not_redundant` (regression guard for finding 1),
-`test_e2_includes_point_in_time_verified_sequence_features_by_default` /
+23 new tests across the session: `test_e1_numeric_representation_is_not_redundant` (finding 1 regression
+guard), `test_e2_includes_point_in_time_verified_sequence_features_by_default` /
 `test_e2_sequence_features_can_be_disabled` / `test_sequence_features_are_leakage_safe_on_a_first_transaction`
-(finding 5), `test_class_weighting_default_uses_sample_weight_and_can_be_disabled` /
+(finding 5), `test_class_weighting_option_actually_changes_training_and_can_be_selected` /
 `test_class_weighting_rejects_unknown_value` (finding 4), `test_run_comparison_multiseed_...` /
-`test_aggregate_seeds_...` (×2) (multi-seed harness, library-level), `test_demo_flow_experiments_multiseed`
-(the same harness exercised through the real Streamlit UI, not just the function). One existing test
-(`test_e1_transforms_numeric_features_instead_of_using_raw_values`) was updated because it had asserted the
-old, buggy triple-numeric behaviour as correct.
+`test_aggregate_seeds_...` (×2) + `test_demo_flow_experiments_multiseed` (multi-seed harness),
+`test_continuous_numeric_mode_preserves_magnitude_that_quantile_bin_discards` /
+`test_continuous_mode_with_coarse_bins_keeps_both_signals` /
+`test_sanity_transformer_learns_with_continuous_numeric_mode` /
+`test_continuous_mode_forward_requires_numeric_tensors` (R2/R3), `test_e0_time_epoch_is_opt_in_and_does_not_
+replace_the_raw_string` (C1). Two existing tests were updated because they asserted behaviour later found to
+be wrong or renamed: `test_e1_transforms_numeric_features_instead_of_using_raw_values` (had asserted the old,
+buggy triple-numeric output as correct) and the `class_weighting` default test (had asserted `sample_weight`
+as the default, before it was measured and reverted).
 
-Four commits, one per fix, each with the full suite run cold before committing:
-`87d3547` (findings 1+5), `54d6cfe` (finding 4), `548b34e` (multi-seed harness). Run `git log --oneline` for
-the exact current head.
+Per-file pass counts (this exact, freshly re-run breakdown): `test_ingestion.py` + `test_roles.py` +
+`test_profiling.py` + `test_config_hardware.py` + `test_quality.py` + `test_basic_preprocessing.py` +
+`test_backends.py` → 34 passed, 1 skipped; `test_levels.py` + `test_experiment.py` → 30 passed (22 + 8);
+`test_model.py` → 11 passed; `test_app.py` → 7 passed. **Total: 34 + 30 + 11 + 7 = 82 passed, 1 skipped.**
+
+Commits this session, each with tests run (fully or per-file as above) before committing: `87d3547`
+(findings 1+5), `54d6cfe` (finding 4), `548b34e` (multi-seed harness), `30f7639` (class_weighting revert),
+`de86c62` (R2/R3), plus the C1 and documentation commits — run `git log --oneline` for the exact current head.
 
 ## Measured, not just implemented: what the audit fixes actually did (this session, after the fixes above)
 
@@ -104,6 +116,47 @@ and was reverted; this is exactly the kind of result the audit exists to catch, 
 **Takeaway for anyone continuing this project: measure before defaulting, the same discipline that caught
 finding 4's regression should be applied to every future config-default change, including the ones already
 made (finding 5's default is a judgement call on weak evidence, not a settled result).**
+
+## Measured, not just implemented (continued): R2/R3 and the finding-3 fix
+
+Two more items implemented this session, each measured with the same 3-seed harness before drawing any
+conclusion (synthetic demo data, `rows=6000`, 10 epochs, patience 4) — no defaults were changed on the
+strength of a single measurement, per the `class_weighting` lesson above.
+
+**R2/R3 — continuous numeric representation** (`representation.numeric_mode`, `src/representation/
+tabular_tokenizer.py`, `src/models/sanity_transformer.py`). Opt-in; `quantile_bin` (the original behaviour)
+stays the default. `continuous` standardizes numeric values (train-fit median/IQR) and gives each numeric
+feature a learned per-feature (weight, bias) affine embedding of the real value, instead of a lookup table
+keyed by quantile bin; `numeric_coarse_bins > 0` additionally keeps a coarse bin token alongside the
+continuous value at the same position (R3). All plumbed end to end (train/predict/save/load); a model built
+without `numeric_positions` is byte-for-byte the original architecture (verified: the full suite's
+`quantile_bin`-mode tests are unaffected).
+
+Measured (E0/E1/E2, 3 seeds):
+
+| Level | quantile_bin (current default) | continuous (R2) | continuous + coarse bin (R3) |
+|---|---|---|---|
+| E0 | 0.513 ± 0.042 | **0.620 ± 0.038** | 0.550 ± 0.083 |
+| E1 | 0.470 ± 0.031 | **0.620 ± 0.035** | 0.568 ± 0.036 |
+| E2 | **0.861 ± 0.033** | 0.674 ± 0.158 | **0.875 ± 0.029** |
+
+A genuinely mixed, level-dependent result, reported as such rather than cherry-picked: R2 clearly helps E0/E1
+but clearly hurts E2 (both mean and 5x the variance) — E2 has ~20+ numeric-ish positions (time, history
+aggregates, sequence features) and a shared-architecture continuous embedding across that many heterogeneous
+signals may be harder for this tiny model to fit than discrete bins are; not yet diagnosed further. R3 looks
+like the best compromise (matches or beats `quantile_bin` on all three levels, variance back to normal), but
+this is 3 seeds on one synthetic dataset — the same strength of evidence that misled the `class_weighting`
+default before it was corrected. **`numeric_mode` stays `quantile_bin` in config; nothing here should be read
+as "R3 is now recommended."**
+
+**C1 — E0's timestamp fix** (`data.e0_add_time_epoch`, `src/preprocessing/levels.py`). Opt-in, default `false`.
+Adds a numeric epoch-seconds column to E0 alongside the unchanged raw timestamp string, closing the ~100%
+"unknown"-token gap finding 3 measured. Measured effect on E0 alone: PR-AUC 0.513 ± 0.042 (off) vs
+0.523 ± 0.032 (on) — barely inside the noise band, not the clear win R2 gave. Plausible explanation, not yet
+confirmed: absolute epoch time under a *temporal* split means every test-period value lies outside the
+training range entirely (pure extrapolation), a problem the audit's underlying research (outside this app)
+found for raw timestamps in a different model too — a relative/derived time signal (hour, day of week, as E1/
+E2 already compute) may matter far more than the absolute epoch value does. Left available, not defaulted on.
 
 ## Original phase history
 
@@ -163,8 +216,9 @@ unavailable without a GPU. 68 tests.
 ## Tests completed at the end of Phase 8 (before the audit)
 
 `pytest` → **68 passed** (unchanged from Phase 7 — no test or source files under `src/`/`tests/` were touched
-that session). Run cold, to confirm the documentation-only changes broke nothing. (For the audit session's own
-test count — 77 passed, 1 skipped — see "Tests completed (this session)" near the top of this file.)
+that session). Run cold, to confirm the documentation-only changes broke nothing. (For the audit session's
+current test count — 82 passed, 1 skipped, and it will keep growing — see "Tests completed (this session)"
+near the top of this file.)
 
 `notebooks/colab_demo.ipynb` was executed end to end with `nbclient` (own verification method, not `pytest`) —
 every cell after the Colab-only setup cell ran without error against this project's real synthetic demo data,
@@ -185,12 +239,15 @@ python -c "import nbformat; from nbclient import NotebookClient; ..."  # execute
 
 ## Current git commit
 
-The commit titled "Update PROJECT_STATUS.md: document the measured class_weighting revert …" (run
+The commit titled "Document R2/R3 and finding-3 (C1) measurements in PROJECT_STATUS.md …" (run
 `git log --oneline -1` for its exact hash; amending this file changes the hash, so it is intentionally not
-pinned here). Five commits this session in order: "Audit fixes 1/2: …" (findings 1+5), "Audit fix 3/4: …"
+pinned here). Commits this session, in order: "Audit fixes 1/2: …" (findings 1+5), "Audit fix 3/4: …"
 (finding 4), "Audit fix 4/4: …" (multi-seed harness), "Update PROJECT_STATUS.md: document audit findings…",
-"Revert class_weighting default to 'none': measured regression, not assumed benefit" — each with the full
-suite run cold before committing.
+"Revert class_weighting default to 'none': measured regression, not assumed benefit", "Document the measured
+class_weighting revert…", "Audit R2/R3: continuous numeric representation…", "Audit C1: opt-in numeric epoch
+for E0…" — each with the full suite passing before committing. The suite is now large enough that a single
+`pytest` invocation exceeds this environment's per-command time limit; run per test file (see "Tests
+completed" above for the exact breakdown) rather than assuming a single `pytest` call will finish.
 
 ## Known issues
 
@@ -202,55 +259,53 @@ Everything listed in each phase's own section above still applies. Additions fro
 - Nemotron never run (no GPU, no verified checkpoint in this environment) — `availability()` reports this
   honestly rather than the app claiming a run that didn't happen.
 - PyTorch reproducibility is machine-local, not an absolute cross-platform guarantee (see Phase 5's notes).
-- **`models.sanity_transformer.class_weighting` now defaults to `sample_weight`, not the old unweighted
-  behaviour.** Any numbers from before this session's fixes are not directly comparable to numbers after —
-  re-run rather than diff old saved `experiments/*.json` files against new ones.
+- `models.sanity_transformer.class_weighting` default is `none` (the original behaviour); `sample_weight` is
+  implemented and available but empirically regresses performance at severe imbalance — see the measured
+  section above. Do not flip this default without re-measuring on whatever data is current at the time.
 - **E1/E2's numeric feature count per column dropped from up to 3 to 1** (audit finding 1). A saved model
   from before this session will not load against the current tokenizer/feature shape.
 - **E2 now includes ~12 extra sequence-feature positions by default** (`features.sequence_length: 3` ×
   4 sub-features, category only when a category column is set) — training is correspondingly slower per
   epoch; `features.include_sequence_features: false` restores the old, smaller E2.
-- Audit findings 2 and 3 (E0's near-total timestamp information loss; cyclical time features losing their
-  periodicity once quantile-binned) are documented but **not yet fixed** — see "Next task."
+- `representation.numeric_mode` (`continuous`, `numeric_coarse_bins`) and `data.e0_add_time_epoch` are
+  implemented, tested, and measured (see above) but both **default off** — R2 helps E0/E1 and clearly hurts
+  E2 (not yet diagnosed why); the E0 timestamp fix barely moves the needle on its own, plausibly because
+  absolute epoch time still extrapolates poorly under a temporal split. Neither is a settled recommendation.
+- Cyclical time features (`hour_sin`/`hour_cos` etc.) still lose their periodicity when fed through
+  `quantile_bin` mode (finding 2/3's remaining, unfixed half — T1 below); `numeric_mode: continuous` would
+  let them stay continuous, but hasn't been tried for cyclical features specifically, only for `amt`-style
+  columns in E0/E1/E2 as a whole.
 
 ## Next task (continuing the audit's recommended order)
 
 Full audit (architecture trace, 6 verified findings, prioritized experiment matrix) is in the conversation
-history that produced this session's commits, not duplicated here. What's left from it, in the order the
-audit recommended:
+history that produced this session's commits, not duplicated here. What's left from it:
 
-1. **R2/R3 — continuous numeric representation.** The audit's own "most important experiment": replace or
-   augment the single quantile-bin token per numeric column (the corrected finding-1 state) with either a
-   continuous linear projection, or a continuous projection concatenated with a coarse bin embedding. This
-   needs a `TabularTokenizer`/`SanityTransformerModel` change (a numeric column can no longer be *only* a
-   token id), not just a `levels.py` change like the four fixes in this session — hasn't been started.
-2. **C1 — parse E0's datetime.** Currently a full-precision string that collapses to "unknown" for ~100% of
-   rows (finding 3, measured, not yet fixed). Feed it as a numeric epoch (or similar) even in the "minimal
-   processing" baseline, so E0-vs-E1/E2 comparisons reflect processing quality, not "has a time feature at
-   all vs. doesn't."
-3. **T1 — feed cyclical features continuously.** Depends on R2/R3's continuous path existing first; otherwise
-   `hour_sin`/`hour_cos` keep losing their periodicity to quantile-bin discretization (finding 2/3).
-4. **S1 — extend finding 5's fix to the text/LLM path.** `text_builder.py` (feeds Hugging Face/Nemotron/API
-   adapters) has the same gap `levels.py` had: it renders `prepared.numeric`/`prepared.categorical`, which
-   still doesn't include `previous_transactions()` for the *text* representation even after this session's
-   fix (that fix only reached the tabular/`TabularTokenizer` path via E2's feature list, which
-   `text_builder.py` also reads — so it likely already inherited the fix for free; verify this rather than
-   assume, then add `format_previous_transactions()` as an explicit text field if the plain field-by-field
-   rendering of `prevK_*` numeric columns isn't as good as the purpose-built text formatter).
-5. Add `class_weighting: pos_weight_natural` (§12's Experiment 4: natural sampling + `pos_weight`, as opposed
-   to this session's oversampling + sample-weight fix) as a second, directly comparable option, if L1 vs L2
-   turns out to matter empirically once run.
-6. **Partially done this session** for findings 4 and 5 specifically (see "Measured, not just implemented"
-   above) — finding 4's fix was measured to regress performance and reverted; finding 5 is measured but
-   inconclusive (3 seeds, small synthetic data). Finding 1 was not A/B tested via the harness (its fix isn't
-   config-reversible — the redundant columns were removed from the code, not toggled), but was proven
-   lossless analytically (100% exact token match, see the original audit). Once items 1–5 above land, extend
-   this same measure-before-trusting discipline to them, and re-run the full E0/E1/E2 comparison, not just
-   the isolated finding-4/5 checks done so far.
-7. **Run it on the real dataset** — still never done, unchanged from before this session.
-8. **Generalization test on a non-fraud dataset**, through the *full app*, not just the `churn` fixture unit
+1. **Diagnose why R2 (continuous numeric) hurts E2 specifically** (measured above: PR-AUC 0.861 → 0.674,
+   std 0.033 → 0.158) before trusting R3 as a fix rather than a lucky combination. Candidates worth checking
+   before anything else: does a higher learning rate or more epochs stabilize R2 on E2 alone (i.e. is it an
+   optimization problem, not a representational one)? Does restricting continuous mode to only the "core"
+   numeric columns (not history/sequence features) close the gap?
+2. **T1 — feed cyclical features continuously**, now that the continuous path exists (item 3 from the
+   previous version of this list is partly unblocked). Try `numeric_mode: continuous` restricted to just
+   `hour_sin`/`hour_cos`/`day_of_week_sin`/`day_of_week_cos` (a per-feature, not per-level, toggle would be
+   needed — not yet implemented; `numeric_mode` is currently all-or-nothing per level).
+3. **S1 — extend finding 5's fix to the text/LLM path.** `text_builder.py` (feeds Hugging Face/Nemotron/API
+   adapters) reads `prepared.numeric`/`prepared.categorical`, the same lists `levels.py`'s E2 now includes
+   `prevK_*` sequence features in — so it likely already inherited the fix for free. **Verify this rather
+   than assume** (nothing in this session touched or tested `text_builder.py`), then consider
+   `format_previous_transactions()`'s purpose-built text rendering as an alternative to the plain
+   field-by-field rendering `text_builder.py` currently does for every column indiscriminately.
+4. Add `class_weighting: pos_weight_natural` (§12's Experiment 4: natural sampling + `pos_weight`, as opposed
+   to this session's oversampling + sample-weight fix, which regressed) as a second, directly comparable
+   option, and measure it the same way before considering it for anything but comparison.
+5. Once 1–4 land (or are explicitly deferred with a reason): re-run the full E0/E1/E2 comparison with
+   whatever combination of `numeric_mode`/`e0_add_time_epoch`/`class_weighting` settings this session's
+   measurements actually support, not just the isolated per-finding checks done so far.
+6. **Run it on the real dataset** — still never done, unchanged from before this session.
+7. **Generalization test on a non-fraud dataset**, through the *full app*, not just the `churn` fixture unit
    tests that already exist.
-9. Multiclass / regression through Processing; `_pending/src/preprocessing/outliers.py`; section 23's other
+8. Multiclass / regression through Processing; `_pending/src/preprocessing/outliers.py`; section 23's other
    items — unchanged from before this session, still deliberately deferred.
 
 ## TODO by phase
@@ -265,7 +320,11 @@ audit recommended:
 - [x] Phase 8: polish, documentation, tests, Colab notebook
 - [x] Audit: findings 1, 4, 5 fixed (redundant numeric triple, unweighted loss under oversampling, dead
       sequence-feature code); multi-seed comparison harness added
-- [ ] Audit: findings 2, 3 fixed (E0 timestamp information loss; cyclical features losing periodicity);
-      R2/R3 (continuous numeric representation); S1 (extend finding 5 to the text/LLM path)
+- [x] Audit: R2/R3 (continuous numeric representation) and C1 (E0 timestamp fix) implemented, tested and
+      measured — both opt-in, neither defaulted on; R2 helps E0/E1 and hurts E2 (undiagnosed), C1 barely
+      moves E0's own number. Finding 2/3's other half (cyclical features under quantile_bin) still open.
+- [ ] Audit: T1 (cyclical features continuous, needs a per-feature not per-level numeric_mode toggle);
+      S1 (verify/extend finding 5 to the text/LLM path, `text_builder.py` — untouched this session);
+      diagnose why R2 regresses E2 before trusting R3's apparent fix
 - [ ] Beyond the 8 phases: run on the real dataset; generalization test on a non-fraud dataset through the full
       app; multiclass/regression through Processing; the rest of section 23

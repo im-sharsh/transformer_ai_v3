@@ -16,6 +16,12 @@ data:
   amount_column: null     # e.g. amt (used for E2 history/velocity features); null = detect from column names
   category_column: null   # e.g. category
   merchant_column: null   # e.g. merchant
+  e0_add_time_epoch: false  # audit finding 3 (measured, not assumed): E0's raw timestamp string collapses to
+                            # the tokenizer's "unknown" token for ~100% of rows (near-unique values fall below
+                            # min_category_count), so E0 effectively has no time signal at all. true adds a
+                            # numeric epoch-seconds column alongside the unchanged raw string. Default false
+                            # until measured against the baseline the same way findings 4/5 were -- do that
+                            # 3-seed comparison before ever flipping this on by default.
 
 upload:
   save_uploads_to: data/raw   # uploaded files are stored here unchanged

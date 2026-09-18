@@ -247,7 +247,22 @@ class DataPreparer:
         features = [c for c in self.df.columns if c not in META and c not in r.excluded and c != r.target]
         steps = ["Minimal formatting: values kept exactly as loaded",
                  f"Excluded {len(r.excluded)} identifier / personal-data / quasi-identifier columns (same policy for every level)"]
-        return self._finish("E0", rows, features, steps, {"excluded": r.excluded})
+        extra = {"excluded": r.excluded}
+        # Audit finding 3 (measured, not assumed): a full-precision timestamp string is near-unique per row, so
+        # every value in TabularTokenizer's default quantile_bin mode falls below min_category_count and the
+        # column collapses to the "unknown" token for ~100% of rows -- E0 effectively has *no* time signal at
+        # all, not "raw" time signal. Opt-in (data.e0_add_time_epoch, default false until measured against the
+        # baseline the same way findings 4/5 were): adds a numeric epoch-seconds column alongside the unchanged
+        # raw string, so E0-vs-E1/E2 can be compared on processing *quality* rather than "has any time signal".
+        if r.time and self.cfg.get("data", {}).get("e0_add_time_epoch", False):
+            t = parse_datetime_column(rows[r.time], "datetime")
+            epoch_col = f"{r.time}__epoch"
+            rows = rows.copy()
+            rows[epoch_col] = (t - pd.Timestamp("1970-01-01")).dt.total_seconds().astype("float64")
+            features = features + [epoch_col]
+            steps.append(f"data.e0_add_time_epoch is on: added {epoch_col} (numeric epoch seconds) alongside "
+                        f"the unchanged raw {r.time} string, so E0 has a usable time signal (see audit finding 3)")
+        return self._finish("E0", rows, features, steps, extra)
 
     def _e1_frame(self) -> tuple[pd.DataFrame, list, list, dict]:
         r, cfg = self.roles, self.cfg
