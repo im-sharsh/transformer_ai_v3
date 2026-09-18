@@ -129,10 +129,12 @@ models:
                              # negligible relative to the abundant majority class — undermining exactly what
                              # oversampling exists to provide. Reverted to "none" (the original, empirically
                              # better behaviour) as the default. "sample_weight" is kept available for direct
-                             # comparison experiments (see models.sanity_transformer.class_weighting docs
-                             # in the code) but is not recommended as-is for severely imbalanced data; a
-                             # gentler correction (e.g. partial reweighting, or natural sampling + pos_weight,
-                             # the brief's own §12 Experiment 4) is unmeasured future work, not this option.
+                             # comparison experiments but is not recommended as-is for severely imbalanced
+                             # data. "pos_weight_natural" (brief's own §12 Experiment 4) was added and measured
+                             # separately -- a different mechanism (boosts the positive class's loss within the
+                             # sampled training set, via BCEWithLogitsLoss's own pos_weight, rather than
+                             # discounting the negative class toward the true population rate); see
+                             # PROJECT_STATUS.md for the measured comparison.
     learning_rate: 0.0005
     batch_size: 256
     epochs: 15

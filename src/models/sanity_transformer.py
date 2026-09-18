@@ -159,9 +159,21 @@ class SanityTransformerAdapter(ModelAdapter):
         # empirically better on this data; "sample_weight" is kept available for direct comparison, not as a
         # recommended setting.
         class_weighting = s.get("class_weighting", "none")
-        if class_weighting not in ("none", "sample_weight"):
-            raise ValueError(f"models.sanity_transformer.class_weighting must be 'none' or 'sample_weight', got {class_weighting!r}")
-        loss_fn = nn.BCEWithLogitsLoss(reduction="none")
+        if class_weighting not in ("none", "sample_weight", "pos_weight_natural"):
+            raise ValueError("models.sanity_transformer.class_weighting must be 'none', 'sample_weight' or "
+                             f"'pos_weight_natural', got {class_weighting!r}")
+        # pos_weight_natural (brief's own S12 Experiment 4): a different mechanism from sample_weight, added
+        # for direct comparison after sample_weight was measured to regress performance. Where sample_weight
+        # discounts the abundant negative class toward the *true* population rate (and was found to make the
+        # rare class's gradient contribution negligible), pos_weight_natural instead boosts the positive
+        # class's loss *within whatever training sample was already drawn* (standard imbalanced-loss practice:
+        # pos_weight = n_negative / n_positive in the sampled training set), leaving the negative class alone.
+        pos_weight = None
+        if class_weighting == "pos_weight_natural":
+            n_pos = int((y == 1).sum().item()) or 1
+            n_neg = int((y == 0).sum().item())
+            pos_weight = torch.tensor(n_neg / n_pos, dtype=torch.float32)
+        loss_fn = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight.to(self.device) if pos_weight is not None else None)
         sample_weight = (torch.tensor(train["_weight"].to_numpy(dtype="float32"))
                          if class_weighting == "sample_weight" and "_weight" in train else None)
         g = torch.Generator().manual_seed(seed)

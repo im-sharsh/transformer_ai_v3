@@ -56,7 +56,7 @@ continuously so their periodicity survives), S1 (extend finding 5's fix into the
 
 ## Tests completed (this session)
 
-`pytest` → **83 passed, 1 skipped** (was 67 passed, 1 skipped before this session; the skip is unchanged —
+`pytest` → **84 passed, 1 skipped** (was 67 passed, 1 skipped before this session; the skip is unchanged —
 no network access to the Hugging Face Hub in this environment). Run cold after every commit. Note: partway
 through this session the suite grew large enough that a single `pytest` invocation exceeds this sandbox's
 per-command time limit (~300s); from the R2/R3 work onward it was run **per test file** instead (still cold,
@@ -79,8 +79,8 @@ as the default, before it was measured and reverted).
 
 Per-file pass counts (this exact, freshly re-run breakdown): `test_ingestion.py` + `test_roles.py` +
 `test_profiling.py` + `test_config_hardware.py` + `test_quality.py` + `test_basic_preprocessing.py` +
-`test_backends.py` + `test_levels.py` + `test_experiment.py` → 64 passed, 1 skipped;
-`test_model.py` → 12 passed; `test_app.py` → 7 passed. **Total: 64 + 12 + 7 = 83 passed, 1 skipped.**
+`test_backends.py` + `test_levels.py` + `test_experiment.py` + `test_app.py` → 71 passed, 1 skipped;
+`test_model.py` → 13 passed. **Total: 71 + 13 = 84 passed, 1 skipped.**
 
 Commits this session, each with tests run (fully or per-file as above) before committing: `87d3547`
 (findings 1+5), `54d6cfe` (finding 4), `548b34e` (multi-seed harness), `30f7639` (class_weighting revert),
@@ -231,7 +231,7 @@ unavailable without a GPU. 68 tests.
 
 `pytest` → **68 passed** (unchanged from Phase 7 — no test or source files under `src/`/`tests/` were touched
 that session). Run cold, to confirm the documentation-only changes broke nothing. (For the audit session's
-current test count — 83 passed, 1 skipped, and it will keep growing — see "Tests completed (this session)"
+current test count — 84 passed, 1 skipped, and it will keep growing — see "Tests completed (this session)"
 near the top of this file.)
 
 `notebooks/colab_demo.ipynb` was executed end to end with `nbclient` (own verification method, not `pytest`) —
@@ -311,12 +311,39 @@ history that produced this session's commits, not duplicated here. What's left f
    — the 12 sequence fields are scattered as individual `key=value` tokens among ~30 unrelated fields, rather
    than grouped as a coherent block the way `format_previous_transactions()` (still unused) would render them.
    Not measured whether that rendering difference matters to a language model; deprioritized below item 4.
-4. Add `class_weighting: pos_weight_natural` (§12's Experiment 4: natural sampling + `pos_weight`, as opposed
-   to this session's oversampling + sample-weight fix, which regressed) as a second, directly comparable
-   option, and measure it the same way before considering it for anything but comparison.
+4. **~~Add `class_weighting: pos_weight_natural`~~ — done this session, see the measured section below.**
+   Promising (better than `none` on E0), but only checked on one level with a baseline that itself showed
+   run-to-run variability — not yet a recommended default.
 5. Once 1–4 land (or are explicitly deferred with a reason): re-run the full E0/E1/E2 comparison with
    whatever combination of `numeric_mode`/`numeric_clip`/`e0_add_time_epoch`/`class_weighting` settings this
    session's measurements actually support, not just the isolated per-finding checks done so far.
+
+## `class_weighting: pos_weight_natural` — implemented and measured (§12 Experiment 4)
+
+A second, mechanistically different option from `sample_weight`: instead of discounting the negative class
+toward the true population rate (which was measured to regress performance), `pos_weight_natural` boosts the
+positive class's loss *within whatever training sample was already drawn* (`BCEWithLogitsLoss`'s own
+`pos_weight = n_negative / n_positive` in the sampled set) — standard imbalanced-loss practice, and it leaves
+the negative class untouched, unlike `sample_weight`. `src/models/sanity_transformer.py`,
+`tests/test_model.py` (2 new tests: must actually change training; must not require `_weight` to be present).
+
+Measured (E0, 3 seeds, all three read together from one script run so the *relative* comparison is trustworthy
+even though the `none` baseline itself showed some run-to-run variability — see caveat below):
+
+| `class_weighting` | PR-AUC | ROC-AUC | F1 |
+|---|---|---|---|
+| `none` (default) | 0.513 ± 0.042 | 0.990 | 0.366 |
+| `sample_weight` (reverted default, kept for comparison) | 0.240 ± 0.202 | 0.837 | 0.280 |
+| **`pos_weight_natural`** | **0.587 ± 0.138** | **0.994** | **0.444** |
+
+A genuinely promising result — better mean, better ROC-AUC, better F1 than the current default — but **not
+yet made the default**, for two reasons: (1) only E0 was checked so far (not E1/E2, where `sample_weight`'s
+effect also varied by level); (2) the `none` baseline itself measured differently across two separate script
+executions with nominally identical settings (0.470 in the earlier finding-4 decomposition vs 0.513 here),
+which is a real reproducibility gap in the measurement methodology itself, not just noise in the treatment —
+worth investigating (possibly unseeded randomness somewhere in schema/role detection) before trusting any
+small-to-moderate effect size measured this way. A 3-seed, single-script, single-level check is informative,
+not sufficient, exactly the standard this whole session has tried to hold itself to.
 6. **Run it on the real dataset** — still never done, unchanged from before this session.
 7. **Generalization test on a non-fraud dataset**, through the *full app*, not just the `churn` fixture unit
    tests that already exist.
@@ -341,8 +368,11 @@ history that produced this session's commits, not duplicated here. What's left f
       own number.
 - [x] Audit: S1 verified — `text_builder.py` already inherits finding 5's sequence features for free (no
       code gap); remaining question is text-rendering quality, not data availability, and is deprioritized.
+- [x] Audit: `class_weighting: pos_weight_natural` implemented and measured — promising on E0 (better than
+      `none`), not yet checked on E1/E2 or made a default; flagged a baseline-reproducibility gap worth
+      investigating (the `none` measurement itself varied across two separate script runs).
 - [ ] Audit: T1 (cyclical features continuous — needs a per-feature, not per-level, `numeric_mode` toggle,
-      not yet built); why R3+clip collapsed on E1 in one run (0.358 ± 0.304, unexplained);
-      `class_weighting: pos_weight_natural` as a second, measured comparison option
+      not yet built); why R3+clip collapsed on E1 in one run (0.358 ± 0.304, unexplained); investigate the
+      `none`-baseline reproducibility gap just found; extend `pos_weight_natural` to E1/E2
 - [ ] Beyond the 8 phases: run on the real dataset; generalization test on a non-fraud dataset through the full
       app; multiclass/regression through Processing; the rest of section 23

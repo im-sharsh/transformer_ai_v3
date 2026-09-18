@@ -180,6 +180,33 @@ def test_class_weighting_option_actually_changes_training_and_can_be_selected():
         "sample weighting must actually change training, not silently no-op"
 
 
+def test_pos_weight_natural_is_a_distinct_mechanism_from_sample_weight():
+    """§12 Experiment 4: boosts the positive class's loss within the sampled training set (standard
+    BCEWithLogitsLoss pos_weight), a different mechanism from sample_weight (which discounts the negative
+    class toward the true population rate, and was measured to regress performance). Must also actually
+    change training, and must not require _weight to be present (it only needs the label column)."""
+    from src.ingestion.demo_data import make_transactions
+    big = make_transactions(n_cards=150, days=120, seed=0)
+    e1 = _prepared_level(big, "tx_pos_weight", "E1", rows=2000)
+
+    torch.manual_seed(0); np.random.seed(0)
+    none_adapter = SanityTransformerAdapter(CFG, device="cpu")
+    none_adapter.train(e1, {"epochs": 1, "batch_size": 256, "class_weighting": "none", "seed": 42})
+
+    torch.manual_seed(0); np.random.seed(0)
+    pw_adapter = SanityTransformerAdapter(CFG, device="cpu")
+    pw_adapter.train(e1, {"epochs": 1, "batch_size": 256, "class_weighting": "pos_weight_natural", "seed": 42})
+
+    p_none = none_adapter.predict(e1.frames["test"])
+    p_pw = pw_adapter.predict(e1.frames["test"])
+    assert not np.allclose(p_none, p_pw), "pos_weight_natural must actually change training"
+
+    frame_no_weight = e1.frames["train"].drop(columns=["_weight"])
+    small = PreparedLevel(e1.level, {**e1.frames, "train": frame_no_weight}, e1.numeric, e1.categorical, e1.info)
+    adapter = SanityTransformerAdapter(CFG, device="cpu")
+    adapter.train(small, {"epochs": 1, "batch_size": 256, "class_weighting": "pos_weight_natural", "seed": 42})  # must not raise
+
+
 def test_class_weighting_rejects_unknown_value():
     from src.ingestion.demo_data import make_transactions
     big = make_transactions(n_cards=80, days=60, seed=0)
