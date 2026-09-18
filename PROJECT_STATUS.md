@@ -11,6 +11,46 @@ audit read the pipeline code end to end and verified its claims by running scrip
 (not by inspection alone) before any code was changed. Full audit write-up is in the conversation history; the
 short version and what was actually fixed is below.
 
+
+## Step 11 — Model-Ready Data product stage (latest change)
+
+Implemented the master prompt's missing bridge between E0/E1/E2 processing and model training:
+
+- Added a dedicated **Model-Ready Data** Streamlit page.
+- Added `src/representation/model_ready.py`, which fits `TabularTokenizer` on the **training split only** and
+  materializes the exact token matrix consumed by the built-in Transformer for train/validation/test.
+- When continuous numeric representation is active, the downloadable data also contains the parallel standardized
+  numeric-value and numeric-mask matrices that the model receives.
+- Added Preview, Schema, Feature dictionary, Processing config, Representation config, and Downloads sections.
+- Added a complete ZIP export containing train/validation/test model-ready data plus `schema.json`,
+  `feature_dictionary.json`, `preprocessing_config.json`, `representation_config.json`, and `processing_report.json`.
+- Parquet remains the preferred format (and is declared in `requirements.txt` via pyarrow); if a partial runtime lacks
+  a parquet engine, the UI/package uses an explicitly named CSV fallback rather than failing or mislabelling bytes.
+- Added direct per-split downloads.
+
+### Subset-selection improvement completed with Step 11
+
+The Processing page no longer restricts customers to the hard-coded 10k/50k/100k/200k/500k choices. It now offers:
+
+- **Full Dataset**
+- **Custom Number of Rows** (exact integer with UI validation range)
+
+The sampler was hardened so a valid custom request is not silently shortened because a class quota cannot be filled;
+it fills the remainder from the available class and recomputes inverse-probability weights from the rows actually
+sampled. Split allocation also caps against rows really available in each split and redistributes any deficit, so the
+requested total is exact. The deterministic sample is still drawn **once** and the same `_row_id` set is reused by
+E0, E1 and E2.
+
+New regression tests in `tests/test_model_ready.py` verify:
+
+1. exported token columns exactly match `TabularTokenizer.transform()`;
+2. the downloadable package contains the required data/metadata artifacts;
+3. an exact custom subset count is returned and identical row IDs are reused across E0/E1/E2.
+
+`pytest -q tests/test_model_ready.py` → **3 passed** in this environment. A larger `test_levels.py` invocation emitted
+all test progress dots but the Python process did not terminate before this container's command timeout, so it is not
+counted here as a completed fresh suite run.
+
 ## Audit findings and fixes (this session)
 
 Five findings, verified empirically (not assumed) by running the real pipeline on synthetic demo data:
@@ -174,6 +214,17 @@ training range entirely (pure extrapolation), a problem the audit's underlying r
 found for raw timestamps in a different model too — a relative/derived time signal (hour, day of week, as E1/
 E2 already compute) may matter far more than the absolute epoch value does. Left available, not defaulted on.
 
+## Continuation audit — current session
+
+- Completed audit item 5: combined E0/E1/E2 comparison under the conservative supported defaults.
+- Persisted exact run metadata and per-seed metrics in `experiments/audit_combined_supported_defaults.json`.
+- No source/config defaults changed: the combined 5-epoch verification was too seed-sensitive to justify one.
+- Environment note: the uploaded ZIP does not contain the prior `.venv`; the available system Python has the
+  core experiment dependencies but not Streamlit. Relevant non-UI tests were therefore run with system Python;
+  full Streamlit tests require restoring/installing the project environment.
+- **Next task:** item 6, run the controlled experiment on the real transaction dataset. The real ~1.3M-row
+  dataset is not included in this repository/upload, so that task is blocked until the dataset is provided.
+
 ## Original phase history
 
 ## Cumulative summary (all phases)
@@ -321,9 +372,21 @@ item's own measurement surfaced (see each item):
    Not measured whether that rendering difference matters to a language model; deprioritized below item 4.
 4. **~~Add `class_weighting: pos_weight_natural`~~ — done this session; extended to E1/E2 as a follow-up
    (see the measured section below).** Mixed across levels, not a clean win — not made a default.
-5. Once 1–4 land (or are explicitly deferred with a reason): re-run the full E0/E1/E2 comparison with
-   whatever combination of `numeric_mode`/`numeric_clip`/`e0_add_time_epoch`/`class_weighting` settings this
-   session's measurements actually support, not just the isolated per-finding checks done so far.
+5. **~~Combined E0/E1/E2 re-run with the settings actually supported by the isolated checks~~ — done in the
+   continuation audit.** The supported conservative configuration remained the current defaults:
+   `numeric_mode: quantile_bin`, `e0_add_time_epoch: false`, `class_weighting: none`, and
+   `continuous_features: []` (with E2 sequence features still enabled). A 10-epoch × 3-seed × 3-level run was
+   attempted first but could not finish within this environment's hard command cap because E2 training plus
+   process shutdown stalled when chained in one process. To finish the controlled combined check without
+   pretending that attempt completed, the matrix was rerun as nine fresh processes at **5 epochs**, using the
+   same deterministic 6,000-row subset and seeds 42/123/456. The sample identity was independently verified:
+   three reconstructions produced SHA-256
+   `ac9b15af2448bb9d694e33b7a335268e19c34eff105b88f7709d59eb68c892e5` for the ordered sampled row IDs /
+   split / target / weight tuple (6,000 rows, 88 positives). Results: E0 PR-AUC **0.336 ± 0.259**, E1
+   **0.100 ± 0.054**, E2 **0.439 ± 0.081**; F1 E0 **0.204 ± 0.064**, E1 **0.046 ± 0.080**, E2
+   **0.373 ± 0.114**. This lower-budget run is highly seed-sensitive and is **not** directly comparable to the
+   earlier 10-epoch isolated tables; it supports no new default change. Exact per-seed results and configuration
+   are persisted in `experiments/audit_combined_supported_defaults.json`.
 
 ## `class_weighting: pos_weight_natural` — implemented and measured (§12 Experiment 4)
 

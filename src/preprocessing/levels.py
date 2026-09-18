@@ -195,7 +195,30 @@ class DataPreparer:
                                 include_all_positives={}, seed=self.seed)
         else:
             n = int(self.rows)
-            sizes = {"train": int(n * f_train), "validation": int(n * f_val), "test": n - int(n * f_train) - int(n * f_val)}
+            if n < 1 or n > len(frame):
+                raise ValueError(f"Requested subset must be between 1 and {len(frame):,} rows; got {n:,}")
+            # Start from the configured split fractions, then cap to the rows actually available in each split
+            # and redistribute any deficit. Random splitting can be off by a few rows from the nominal fraction;
+            # this guarantees the customer still receives exactly the row count they requested.
+            requested = {"train": int(n * f_train), "validation": int(n * f_val)}
+            requested["test"] = n - requested["train"] - requested["validation"]
+            available = frame["split"].value_counts().to_dict()
+            sizes = {k: min(requested[k], int(available.get(k, 0))) for k in ["train", "validation", "test"]}
+            deficit = n - sum(sizes.values())
+            while deficit > 0:
+                progressed = False
+                for k in ["train", "validation", "test"]:
+                    capacity = int(available.get(k, 0)) - sizes[k]
+                    if capacity <= 0:
+                        continue
+                    add = min(capacity, deficit)
+                    sizes[k] += add
+                    deficit -= add
+                    progressed = True
+                    if deficit == 0:
+                        break
+                if not progressed:
+                    raise ValueError(f"Could not allocate the requested {n:,} rows across train/validation/test")
             scfg = SampleConfig(sizes=sizes, positive_share={"train": s["train_positive_share"],
                                                              "validation": s["validation_positive_share"]},
                                 include_all_positives={"test": s["keep_all_test_positives"]},

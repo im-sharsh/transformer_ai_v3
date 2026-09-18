@@ -15,7 +15,7 @@ def _no_errors(at):
 def test_every_section_renders_without_data():
     at = streamlit_testing.AppTest.from_file(APP, default_timeout=60).run()
     _no_errors(at)
-    for page in ["Dashboard", "Data Upload", "Profiling", "Quality Analysis", "Processing", "Model", "Experiments", "Results"]:
+    for page in ["Dashboard", "Data Upload", "Profiling", "Quality Analysis", "Processing", "Model-Ready Data", "Model", "Experiments", "Results"]:
         at.sidebar.radio[0].set_value(page).run()
         _no_errors(at)
     at.sidebar.radio[0].set_value("Results").run()

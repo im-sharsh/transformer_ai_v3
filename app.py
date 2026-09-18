@@ -25,6 +25,7 @@ from src.models.sanity_transformer import SanityTransformerAdapter
 from src.preprocessing.basic_preprocessing import run_basic_preprocessing
 from src.preprocessing.cleaner import CleaningConfig
 from src.preprocessing.levels import DataPreparer, infer_roles
+from src.representation.model_ready import build_model_ready, model_ready_zip_bytes, serialize_model_ready_frame
 from src.profiling.profiler import profile_dataset
 from src.quality.quality_engine import assess_quality
 from src.utils.config import ROOT, load_config
@@ -33,7 +34,7 @@ from src.utils.hardware import detect_hardware, recommendations
 logging.basicConfig(level=logging.WARNING)
 st.set_page_config(page_title="Transaction Data Intelligence", layout="wide")
 
-PAGES = ["Dashboard", "Data Upload", "Profiling", "Quality Analysis", "Processing", "Model", "Experiments", "Results"]
+PAGES = ["Dashboard", "Data Upload", "Profiling", "Quality Analysis", "Processing", "Model-Ready Data", "Model", "Experiments", "Results"]
 
 CSS = """
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
@@ -66,7 +67,7 @@ h2, h3 { font-weight: 600; letter-spacing: -0.005em; }
 def init_state():
     defaults = {"nav": "Dashboard", "df": None, "meta": None, "schema": None, "roles": None, "profile": None,
                 "profile_info": None, "source": None, "error": None, "quality": None, "preprocessing": None,
-                "preparer": None, "levels": None, "model": None, "experiment": None}
+                "preparer": None, "levels": None, "model_ready": None, "model": None, "experiment": None}
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
 
@@ -105,7 +106,7 @@ def set_dataset(path: Path, source: str):
         roles = roles.with_overrides(ds.df, entity=overrides.get("entity_column"), datetime=overrides.get("datetime_column"),
                                      task=hints.get("task"))
     st.session_state.update(df=ds.df, meta=ds.metadata, schema=schema, roles=roles, profile=None, profile_info=None,
-                            quality=None, preprocessing=None, preparer=None, levels=None, model=None, experiment=None,
+                            quality=None, preprocessing=None, preparer=None, levels=None, model_ready=None, model=None, experiment=None,
                             source=source, error=None,
                             load_seconds=round(time.time() - t0, 1))
 
@@ -133,6 +134,7 @@ def sidebar():
         df, roles = st.session_state.df, st.session_state.roles
         prof, qual, prep = st.session_state.profile, st.session_state.quality, st.session_state.preprocessing
         levels, model = st.session_state.levels, st.session_state.model
+        model_ready = st.session_state.model_ready
         experiment = st.session_state.experiment
         steps = [("Load data", "done" if df is not None else "ready"),
                  ("Confirm schema and task", "done" if roles is not None and roles.target else ("ready" if df is not None else "wait")),
@@ -140,6 +142,7 @@ def sidebar():
                  ("Quality analysis", "done" if qual is not None else ("ready" if df is not None else "wait")),
                  ("Basic preprocessing", "done" if prep is not None else ("ready" if df is not None else "wait")),
                  ("Process E0 / E1 / E2", "done" if levels else ("ready" if df is not None else "wait")),
+                 ("Package model-ready data", "done" if model_ready else ("ready" if levels else "wait")),
                  ("Train and evaluate", "done" if model else ("ready" if levels else "wait")),
                  ("Compare experiments", "done" if experiment else ("ready" if levels else "wait"))]
         html = "".join(f'<div class="tdi-step tdi-{state}"><span class="n">{i}</span><span>{name}'
@@ -557,21 +560,25 @@ def page_processing():
                         hide_index=True, width="stretch")
 
     sc = cfg["subsets"]
-    options = [str(o) for o in sc["options"]]
-    default = str(sc["cpu_default"]) if str(sc["cpu_default"]) in options else options[0]
     left, right = st.columns([2, 1])
-    subset = left.selectbox("Subset size (rows drawn for this run; reused by every level)", options,
-                            index=options.index(default), help="'full' uses every available row after the split.")
+    subset_mode = left.radio("Dataset size", ["Full Dataset", "Custom Number of Rows"], index=1, horizontal=True,
+                             help="The selected row IDs are drawn once and reused unchanged by E0, E1 and E2.")
+    default_rows = min(int(sc.get("cpu_default", 10000)), len(df))
+    requested_rows = None
+    if subset_mode == "Custom Number of Rows":
+        requested_rows = left.number_input("Number of rows", min_value=1, max_value=max(len(df), 1),
+                                           value=max(default_rows, 1), step=1, key="custom_subset_rows")
+        left.caption(f"Valid range: 1–{len(df):,}. The pipeline will not silently change this value.")
     method = "temporal" if cfg["split"]["method"] == "temporal" and level_roles.time else "random"
     f = cfg["split"]["fractions"]
     right.metric("Split", method.capitalize(), help=f"{f[0]:.0%} train / {f[1]:.0%} validation / {f[2]:.0%} test")
 
     if st.button("Prepare split and sample", type="primary", key="prepare_split"):
-        with st.spinner("Assigning train / validation / test and drawing the sample…"):
-            preparer = DataPreparer(df, ps, level_roles, cfg, rows="full" if subset == "full" else int(subset),
-                                    seed=cfg["project"]["seed"])
+        rows = "full" if subset_mode == "Full Dataset" else int(requested_rows)
+        with st.spinner("Assigning train / validation / test and drawing one deterministic sample for every level…"):
+            preparer = DataPreparer(df, ps, level_roles, cfg, rows=rows, seed=cfg["project"]["seed"])
             preparer.prepare_split()
-        st.session_state.preparer, st.session_state.levels = preparer, {}
+        st.session_state.preparer, st.session_state.levels, st.session_state.model_ready = preparer, {}, {}
 
     preparer = st.session_state.preparer
     if preparer is None:
@@ -635,6 +642,69 @@ def render_level(preparer, level: str):
     st.markdown("**Preview (train split)**")
     preview_cols = [c for c in prepared.frames["train"].columns if not c.startswith("_")]
     st.dataframe(prepared.frames["train"][preview_cols].head(20), width="stretch")
+
+
+def page_model_ready():
+    st.title("Model-Ready Data")
+    st.markdown('<p class="tdi-lead">Inspect and download the exact representation produced for the built-in '
+                'Transformer after E0 / E1 / E2 preparation. Representation state is fitted on training rows only '
+                'and then applied unchanged to validation and test.</p>', unsafe_allow_html=True)
+    levels = st.session_state.levels
+    if not levels:
+        st.info("Build at least one E0 / E1 / E2 level on the Processing page first.")
+        return
+
+    cfg = config()
+    level = st.selectbox("Prepared level", list(levels), format_func=lambda l: f"{l} · {levels[l].info['name']}",
+                         key="model_ready_level")
+    cache = st.session_state.model_ready
+    if not isinstance(cache, dict):
+        cache = {}
+        st.session_state.model_ready = cache
+    if level not in cache:
+        with st.spinner(f"Creating the {level} Transformer representation…"):
+            cache[level] = build_model_ready(levels[level], cfg)
+    artifacts = cache[level]
+
+    rcfg = artifacts.representation_config
+    c = st.columns(4)
+    c[0].metric("Sequence positions", rcfg["n_positions"])
+    c[1].metric("Vocabulary", f"{artifacts.feature_dictionary['vocab_size']:,}")
+    c[2].metric("Numeric mode", str(rcfg.get("numeric_mode", "quantile_bin")))
+    c[3].metric("Continuous positions", len(rcfg.get("continuous_numeric_positions", [])))
+    st.caption("Each parquet file contains row metadata/target plus the token matrix actually consumed by the built-in "
+               "Transformer. If continuous numeric representation is active, the parallel numeric value and mask "
+               "matrices are included too.")
+
+    tabs = st.tabs(["Preview", "Schema", "Feature dictionary", "Processing config", "Representation config", "Downloads"])
+    with tabs[0]:
+        split = st.selectbox("Split", ["train", "validation", "test"], key="model_ready_preview_split")
+        st.dataframe(artifacts.frames[split].head(20), width="stretch")
+    with tabs[1]:
+        st.json(artifacts.schema)
+    with tabs[2]:
+        positions = pd.DataFrame(artifacts.feature_dictionary["sequence_positions"])
+        st.dataframe(positions, hide_index=True, width="stretch")
+        with st.expander("Tokenizer vocabulary and fitted representation state"):
+            st.json(artifacts.feature_dictionary["tokenizer"])
+    with tabs[3]:
+        st.json(artifacts.preprocessing_config)
+    with tabs[4]:
+        st.json(artifacts.representation_config)
+    with tabs[5]:
+        package = model_ready_zip_bytes(artifacts)
+        st.download_button("Download complete model-ready package (.zip)", data=package,
+                           file_name=f"model_ready_{level}.zip", mime="application/zip",
+                           key=f"download_model_ready_{level}", type="primary")
+        st.caption("Package: train/validation/test data plus schema.json, feature_dictionary.json, "
+                   "preprocessing_config.json, representation_config.json, processing_report.json. Parquet is "
+                   "used when the installed parquet engine is available; otherwise the data files are explicit CSV fallbacks.")
+        for split in ["train", "validation", "test"]:
+            filename, payload, mime = serialize_model_ready_frame(artifacts.frames[split], split)
+            suffix = filename.rsplit(".", 1)[-1]
+            st.download_button(f"Download {split}.{suffix}", data=payload,
+                               file_name=f"{level.lower()}_{filename}", mime=mime,
+                               key=f"download_model_ready_{level}_{split}")
 
 
 def page_model():
@@ -877,6 +947,8 @@ def main():
             page_quality()
         elif page == "Processing":
             page_processing()
+        elif page == "Model-Ready Data":
+            page_model_ready()
         elif page == "Model":
             page_model()
         elif page == "Experiments":

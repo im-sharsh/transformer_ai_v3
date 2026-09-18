@@ -24,25 +24,51 @@ class SampleConfig:
 
 
 def draw_sample(frame: pd.DataFrame, target: str, cfg: SampleConfig) -> pd.DataFrame:
-    """frame needs columns: _row_id, split, <target>. Returns rows with a _weight column."""
+    """Draw exactly the requested number of rows per split and add inverse-probability class weights.
+
+    The selection is deterministic for a fixed seed. Positive-share settings influence the class mix, but if
+    one class cannot supply its requested quota the remainder is filled from the other class instead of silently
+    returning fewer rows than the customer requested.
+    """
     parts = []
     for i, (split, size) in enumerate(cfg.sizes.items()):
         pool = frame[frame["split"] == split]
+        size = int(size)
+        if size < 0 or size > len(pool):
+            raise ValueError(f"Requested {size:,} rows from split '{split}', but only {len(pool):,} are available")
+        if size == 0:
+            continue
         y = pd.to_numeric(pool[target], errors="coerce")
         pos, neg = pool[y == 1], pool[y == 0]
         if cfg.include_all_positives.get(split):
-            n_pos = min(len(pos), int(size * cfg.max_positive_share))
+            desired_pos = min(len(pos), int(size * cfg.max_positive_share))
         elif split in cfg.positive_share:
-            n_pos = min(len(pos), round(size * cfg.positive_share[split]))
+            desired_pos = min(len(pos), round(size * cfg.positive_share[split]))
         else:
-            n_pos = min(len(pos), round(size * len(pos) / max(len(pool), 1)))
-        n_neg = min(len(neg), size - n_pos)
+            desired_pos = min(len(pos), round(size * len(pos) / max(len(pool), 1)))
+        n_pos = min(desired_pos, len(pos))
+        n_neg = min(size - n_pos, len(neg))
+        # Guarantee an exact row count whenever size <= len(pool). This matters for the customer-facing custom
+        # subset control: an imbalanced or one-class split must not silently shrink their requested subset.
+        remaining = size - n_pos - n_neg
+        if remaining > 0:
+            add_pos = min(remaining, len(pos) - n_pos)
+            n_pos += add_pos
+            remaining -= add_pos
+        if remaining > 0:
+            add_neg = min(remaining, len(neg) - n_neg)
+            n_neg += add_neg
+            remaining -= add_neg
+        if remaining:
+            raise ValueError(f"Could not draw the requested {size:,} rows from split '{split}'")
+
         sp = pos.sample(n=n_pos, random_state=cfg.seed + i) if n_pos else pos.iloc[0:0]
         sn = neg.sample(n=n_neg, random_state=cfg.seed + 100 + i) if n_neg else neg.iloc[0:0]
         sp = sp.assign(_weight=len(pos) / max(n_pos, 1))
         sn = sn.assign(_weight=len(neg) / max(n_neg, 1))
-        parts.append(pd.concat([sp, sn]).sample(frac=1, random_state=cfg.seed + 200 + i))
-    return pd.concat(parts, ignore_index=True)
+        part = pd.concat([sp, sn]).sample(frac=1, random_state=cfg.seed + 200 + i)
+        parts.append(part)
+    return pd.concat(parts, ignore_index=True) if parts else frame.iloc[0:0].assign(_weight=pd.Series(dtype=float))
 
 
 def sample_report(sample: pd.DataFrame, target: str) -> dict:
