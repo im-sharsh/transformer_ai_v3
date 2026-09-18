@@ -103,12 +103,20 @@ representation:            # Phase 5: turns E0/E1/E2 features into token ids, th
   numeric_coarse_bins: 0      # only used when numeric_mode: continuous. >0 (e.g. 4) additionally gives each
                               # numeric feature a coarse quantile-bin token alongside its continuous value (the
                               # brief's Representation D); 0 is pure continuous (Representation B/R2).
-  numeric_clip: 5.0           # only used when numeric_mode: continuous. Clips standardized numeric values to
-                              # +/-this before they reach the model. Diagnosed necessary (audit session): some
-                              # engineered ratio/z-score features have standardized values up to |z|~30; a
+  numeric_clip: 5.0           # applies to any continuous numeric position (numeric_mode: continuous, or a
+                              # column named in continuous_features below). Clips standardized numeric values
+                              # to +/-this before they reach the model. Diagnosed necessary (audit session):
+                              # some engineered ratio/z-score features have standardized values up to |z|~30; a
                               # handful of unclipped outliers measurably hurt both accuracy and seed-to-seed
                               # stability on E2 (PR-AUC 0.861->0.674, std 0.033->0.158 with no clipping;
                               # 0.674->0.838, std 0.158->0.055 with clip=5). null disables clipping.
+  continuous_features: []     # audit T1: column names ALWAYS kept continuous, independent of numeric_mode.
+                              # Lets a specific feature (e.g. hour_sin, hour_cos -- whose whole point is a
+                              # smooth value a model can learn adjacency from, which quantile-bin tokenization
+                              # throws away) go continuous without also switching two dozen unrelated,
+                              # outlier-prone history features (numeric_mode: continuous would do that, and
+                              # was the confound stopping T1 from being tested in isolation). Empty by default:
+                              # identical behaviour to before this feature existed. Not yet measured.
 
 models:
   sanity_transformer:       # Phase 5: built-in small Transformer (CPU-friendly; not meant to be state of the art)

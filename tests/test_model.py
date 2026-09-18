@@ -74,6 +74,40 @@ def test_continuous_mode_with_coarse_bins_keeps_both_signals():
     assert len(np.unique(values[:, 1])) > 4                     # but the continuous value still varies within each bin
 
 
+def test_continuous_features_toggles_one_column_without_touching_the_rest():
+    """Audit T1: continuous_features lets a specific numeric column go continuous while the level-wide
+    numeric_mode stays 'quantile_bin' for everything else -- the isolation that makes it possible to test
+    a cyclical feature's continuous representation without the R2/E2 outlier confound from other columns."""
+    df = pd.DataFrame({"hour_sin": np.sin(np.linspace(0, 2 * np.pi, 200)),
+                       "card_ratio": np.concatenate([np.random.default_rng(0).normal(1, 0.2, 199), [500.0]]),
+                       "cat": ["a", "b"] * 100})
+    tok = TabularTokenizer(8, 1, numeric_mode="quantile_bin", continuous_features=["hour_sin"])
+    tok.fit(df, ["hour_sin", "card_ratio"], ["cat"])
+    assert tok.numeric_positions == [1], "only hour_sin's position, not card_ratio's"
+    assert "hour_sin" in tok.numeric_stats and "hour_sin" not in tok.edges
+    assert "card_ratio" in tok.edges and "card_ratio" not in tok.numeric_stats
+    ids = tok.transform(df)
+    values, mask = tok.transform_numeric(df)
+    assert set(np.unique(ids[:, 1]).tolist()) <= {tok.special["hour_sin"]["missing"], 0}, "hour_sin: no bin token"
+    assert len(np.unique(ids[:, 2])) > 1, "card_ratio: still quantile-binned, a real token id, not PAD"
+    assert mask[:, 1].all() and not mask[:, 2].any(), "only the continuous column has a numeric_transform mask"
+
+    restored = TabularTokenizer.from_dict(tok.to_dict())
+    assert restored.continuous_features == {"hour_sin"} and restored.numeric_positions == [1]
+    np.testing.assert_array_equal(restored.transform(df), ids)
+
+
+def test_continuous_features_empty_is_identical_to_before_this_feature_existed(transactions):
+    e1 = _prepared_level(transactions, "tx_cf_empty", "E1")
+    a = TabularTokenizer(CFG["representation"]["numeric_bins"], CFG["representation"]["min_category_count"])
+    a.fit(e1.frames["train"], e1.numeric, e1.categorical)
+    b = TabularTokenizer(CFG["representation"]["numeric_bins"], CFG["representation"]["min_category_count"],
+                         continuous_features=[])
+    b.fit(e1.frames["train"], e1.numeric, e1.categorical)
+    np.testing.assert_array_equal(a.transform(e1.frames["test"]), b.transform(e1.frames["test"]))
+    assert a.numeric_positions == b.numeric_positions == []
+
+
 def test_continuous_mode_clips_extreme_standardized_values():
     """Diagnosed cause of R2's E2 regression (audit session): a handful of engineered ratio/z-score features
     have standardized values up to |z|~30; numeric_clip caps them before they reach the model."""

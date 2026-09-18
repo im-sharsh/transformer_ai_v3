@@ -14,6 +14,17 @@ floats; transform() still returns token ids (a per-feature "missing" marker, a c
 coarse_bins > 0 -- the R3 variant -- or PAD otherwise), and the new transform_numeric() returns the parallel
 (values, mask) arrays the model actually reads the magnitude from. This is strictly opt-in: the default mode
 and its output shape/dtype are unchanged from before this feature existed.
+
+continuous_features (audit T1, opt-in, independent of numeric_mode): a set of column names that are ALWAYS
+kept continuous, regardless of the level-wide numeric_mode. Added because numeric_mode alone is all-or-nothing
+per level, which makes it impossible to test "does keeping a *specific* feature continuous help" without also
+changing every other numeric column at the same time -- exactly the situation E2's cyclical time features
+(hour_sin/hour_cos/day_of_week_sin/day_of_week_cos) were in: their whole point is a smooth value a model can
+learn adjacency from, which quantile-bin tokenization (the default) throws away, but turning on
+numeric_mode="continuous" for all of E2 also touches two dozen unrelated, outlier-prone history features (see
+the R2/E2 diagnosis) as a confound. With numeric_mode="quantile_bin" (still the level-wide default) and
+continuous_features={"hour_sin", ...}, only the named columns go continuous; everything else is unaffected --
+verified: with continuous_features=[], behaviour is identical to before this feature existed.
 """
 from __future__ import annotations
 
@@ -25,7 +36,7 @@ PAD, CLS = 0, 1
 
 class TabularTokenizer:
     def __init__(self, numeric_bins: int = 16, min_category_count: int = 5, numeric_mode: str = "quantile_bin",
-                coarse_bins: int = 0, numeric_clip: float | None = None):
+                coarse_bins: int = 0, numeric_clip: float | None = None, continuous_features: list | None = None):
         if numeric_mode not in ("quantile_bin", "continuous"):
             raise ValueError(f"numeric_mode must be 'quantile_bin' or 'continuous', got {numeric_mode!r}")
         self.numeric_bins, self.min_count = numeric_bins, min_category_count
@@ -37,23 +48,30 @@ class TabularTokenizer:
         # +/-5 recovered most of the gap (0.674->0.838) and cut the variance back down (0.158->0.055). None
         # (the default) means no clipping, matching this feature's behaviour before the diagnosis.
         self.numeric_clip = numeric_clip
+        self.continuous_features = set(continuous_features or [])
         self.numeric, self.categorical = [], []
         self.edges: dict = {}
         self.vocab: dict = {}          # feature -> {value_or_bin: token}
         self.special: dict = {}        # feature -> {"missing": id[, "unknown": id]}
-        self.numeric_stats: dict = {}  # continuous mode only: feature -> {"median":, "scale":}
+        self.numeric_stats: dict = {}  # continuous columns only: feature -> {"median":, "scale":}
         self.vocab_size = 2
 
     def _new(self) -> int:
         self.vocab_size += 1
         return self.vocab_size - 1
 
+    def _is_continuous(self, c: str) -> bool:
+        return self.numeric_mode == "continuous" or c in self.continuous_features
+
     def fit(self, train: pd.DataFrame, numeric: list, categorical: list) -> "TabularTokenizer":
         self.numeric, self.categorical = list(numeric), list(categorical)
+        unknown_continuous = self.continuous_features - set(self.numeric)
+        if unknown_continuous:
+            raise ValueError(f"continuous_features names columns not in the numeric feature list: {unknown_continuous}")
         for c in self.numeric:
             x = pd.to_numeric(train[c], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
             self.special[c] = {"missing": self._new()}
-            if self.numeric_mode == "quantile_bin":
+            if not self._is_continuous(c):
                 edges = np.unique(np.quantile(x, np.linspace(0, 1, self.numeric_bins + 1)[1:-1])) if len(x) else np.array([])
                 self.edges[c] = edges
                 self.vocab[c] = {b: self._new() for b in range(len(edges) + 1)}
@@ -82,8 +100,9 @@ class TabularTokenizer:
 
     @property
     def numeric_positions(self) -> list:
-        """Sequence positions (0-indexed, CLS at 0) that carry a numeric value in continuous mode."""
-        return list(range(1, 1 + len(self.numeric)))
+        """Sequence positions (0-indexed, CLS at 0) of numeric columns kept continuous -- may be a strict
+        subset of all numeric positions when continuous_features is used with numeric_mode='quantile_bin'."""
+        return [j for j, c in enumerate(self.numeric, start=1) if self._is_continuous(c)]
 
     def transform(self, df: pd.DataFrame) -> np.ndarray:
         out = np.zeros((len(df), self.n_positions), dtype=np.int64)
@@ -91,7 +110,7 @@ class TabularTokenizer:
         for j, c in enumerate(self.numeric, start=1):
             x = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype="float64")
             bad = ~np.isfinite(x)
-            binned = self.numeric_mode == "quantile_bin" or self.coarse_bins > 0
+            binned = (not self._is_continuous(c)) or self.coarse_bins > 0
             if binned:
                 bins = np.searchsorted(self.edges[c], np.where(bad, 0, x), side="right")
                 ids = np.vectorize(self.vocab[c].get)(bins) if len(x) else np.array([], dtype=np.int64)
@@ -106,16 +125,19 @@ class TabularTokenizer:
         return out
 
     def transform_numeric(self, df: pd.DataFrame) -> tuple:
-        """Continuous mode only. Returns (values, mask), each shape (len(df), n_positions), float32.
-        `values` is the standardized numeric value at numeric positions (0 elsewhere and where missing);
-        `mask` is 1.0 at a present numeric position, 0.0 elsewhere (including CLS/categorical positions
-        and missing numeric values) -- the model multiplies its numeric contribution by this mask."""
-        if self.numeric_mode != "continuous":
-            raise RuntimeError("transform_numeric() is only meaningful in numeric_mode='continuous'")
+        """Returns (values, mask), each shape (len(df), n_positions), float32. `values` is the standardized
+        numeric value at *continuous* numeric positions (0 elsewhere, including still-binned numeric columns,
+        and where missing); `mask` is 1.0 at a present continuous numeric position, 0.0 elsewhere -- the model
+        multiplies its numeric contribution by this mask. Safe to call even if no column is continuous (an
+        all-zero result); raises only if fit() was never called."""
+        if not self.numeric_stats and not self.numeric:
+            pass  # nothing to compute; falls through to an all-zero result below, which is correct
         n = len(df)
         values = np.zeros((n, self.n_positions), dtype=np.float32)
         mask = np.zeros((n, self.n_positions), dtype=np.float32)
         for j, c in enumerate(self.numeric, start=1):
+            if not self._is_continuous(c):
+                continue
             x = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype="float64")
             good = np.isfinite(x)
             stats = self.numeric_stats[c]
@@ -129,6 +151,7 @@ class TabularTokenizer:
     def to_dict(self) -> dict:
         return {"numeric_bins": self.numeric_bins, "min_category_count": self.min_count,
                 "numeric_mode": self.numeric_mode, "coarse_bins": self.coarse_bins, "numeric_clip": self.numeric_clip,
+                "continuous_features": sorted(self.continuous_features),
                 "numeric": self.numeric, "categorical": self.categorical,
                 "edges": {c: e.tolist() for c, e in self.edges.items()},
                 "vocab": {c: {str(k): v for k, v in m.items()} for c, m in self.vocab.items()},
@@ -137,7 +160,7 @@ class TabularTokenizer:
     @classmethod
     def from_dict(cls, d: dict) -> "TabularTokenizer":
         tok = cls(d["numeric_bins"], d["min_category_count"], d.get("numeric_mode", "quantile_bin"),
-                  d.get("coarse_bins", 0), d.get("numeric_clip"))
+                  d.get("coarse_bins", 0), d.get("numeric_clip"), d.get("continuous_features"))
         tok.numeric, tok.categorical, tok.special, tok.vocab_size = d["numeric"], d["categorical"], d["special"], d["vocab_size"]
         tok.numeric_stats = d.get("numeric_stats", {})
         tok.edges = {c: np.array(e) for c, e in d["edges"].items()}

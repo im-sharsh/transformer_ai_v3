@@ -104,19 +104,21 @@ class SanityTransformerAdapter(ModelAdapter):
         numeric_mode = self.rcfg.get("numeric_mode", "quantile_bin")
         coarse_bins = self.rcfg.get("numeric_coarse_bins", 0)
         numeric_clip = self.rcfg.get("numeric_clip")
+        continuous_features = self.rcfg.get("continuous_features")
         self.tokenizer = TabularTokenizer(self.rcfg["numeric_bins"], self.rcfg["min_category_count"],
                                           numeric_mode=numeric_mode, coarse_bins=coarse_bins,
-                                          numeric_clip=numeric_clip).fit(
+                                          numeric_clip=numeric_clip, continuous_features=continuous_features).fit(
             prepared.frames["train"], prepared.numeric, prepared.categorical)
         m = self.mcfg
-        numeric_positions = self.tokenizer.numeric_positions if numeric_mode == "continuous" else None
+        numeric_positions = self.tokenizer.numeric_positions or None
         self.model = SanityTransformerModel(self.tokenizer.vocab_size, self.tokenizer.n_positions, m["d_model"], m["n_heads"],
                                             m["n_layers"], m["dim_feedforward"], m["dropout"], m["pooling"],
                                             numeric_positions=numeric_positions).to(self.device)
 
     def _numeric_tensors(self, frame: pd.DataFrame):
-        """(values, mask) tensors if the tokenizer is in continuous mode, else (None, None)."""
-        if self.tokenizer.numeric_mode != "continuous":
+        """(values, mask) tensors if the tokenizer has any continuous numeric position (whole-level
+        numeric_mode='continuous', or specific columns via continuous_features), else (None, None)."""
+        if not self.tokenizer.numeric_positions:
             return None, None
         values, mask = self.tokenizer.transform_numeric(frame)
         return torch.from_numpy(values), torch.from_numpy(mask)
@@ -286,7 +288,7 @@ class SanityTransformerAdapter(ModelAdapter):
         self.mcfg, self.threshold = meta["model_config"], meta["threshold"]
         self.tokenizer = TabularTokenizer.from_dict(json.loads((path / "tokenizer.json").read_text()))
         m = self.mcfg
-        numeric_positions = self.tokenizer.numeric_positions if self.tokenizer.numeric_mode == "continuous" else None
+        numeric_positions = self.tokenizer.numeric_positions or None
         self.model = SanityTransformerModel(self.tokenizer.vocab_size, self.tokenizer.n_positions, m["d_model"], m["n_heads"],
                                             m["n_layers"], m["dim_feedforward"], m["dropout"], m["pooling"],
                                             numeric_positions=numeric_positions).to(self.device)
