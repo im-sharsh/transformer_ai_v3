@@ -471,3 +471,97 @@ rest.** Not made a default. `class_weighting` stays `none`.
       reproducibility gap; extend `pos_weight_natural` to E1/E2
 - [ ] Beyond the 8 phases: run on the real dataset; multiclass/regression through Processing; the rest of
       section 23
+
+## Step 30 — pretrained GPU fine-tuning benchmark started (2026-09-18)
+
+Added `notebooks/pretrained_gpu_finetuning.ipynb` as the first controlled GPU benchmark for a pretrained
+Transformer. This is intentionally separate from the built-in tabular-token Transformer: pretrained language
+models must use their own tokenizer, so the notebook reuses the exact same selected `_row_id` values and
+train/validation/test splits for E0/E1/E2, renders each level as generic `feature=value` text, and then applies
+the pretrained tokenizer.
+
+Initial verified checkpoint: `distilbert/distilbert-base-uncased` (small pretrained encoder suitable for
+sequence classification and practical on a normal Colab GPU). The notebook implements three explicit adaptation
+modes:
+
+- `frozen_head`: freeze the pretrained encoder and train only the classification head;
+- `lora`: PEFT/LoRA on DistilBERT attention projections (`q_lin`, `v_lin`) plus the sequence-classification head;
+- `full`: update all parameters with a lower learning rate (kept optional for the first smoke test).
+
+The benchmark uses validation weighted PR-AUC for checkpoint selection, chooses the F1 threshold on validation,
+and reports weighted test PR-AUC / ROC-AUC / precision / recall / F1. Per-run JSON artifacts are written under
+`experiments/pretrained_gpu/`.
+
+Important experimental rule retained: construct one `DataPreparer`, call `prepare_split()` once, and build E0,
+E1 and E2 from that same preparer. The notebook asserts exact row-order equality across levels before training.
+
+Not executed in this environment: pretrained-model training itself requires downloading the model and a CUDA GPU.
+The notebook code cells were syntax-validated locally; actual GPU metrics remain **Not yet executed** and must not
+be reported until a Colab/Kaggle/CUDA run completes.
+
+## Current research pass — raw vs AI-ready signal-loss diagnosis (2026-09-19)
+
+Added an evidence-first investigation path for the current issue where E0/raw can outperform E1/E2:
+
+- `features.enabled_groups` now supports independent E2 ablations: `temporal`, `history`, `sequence`.
+- `src/evaluation/signal_diagnostics.py` measures train-fitted representation compression, categorical UNKNOWN
+  rate, near-constant representations, and leakage-safe univariate target signal before GPU training.
+- `notebooks/AutoData_GPU_Research_Benchmark.ipynb` runs the same backend on Colab CUDA, performs 3-seed
+  E0/E1/E2 comparisons, continuous-vs-quantile numeric experiments, E2 feature-family ablations, and exports
+  reproducible result artifacts.
+- No production representation default was changed. The existing evidence is mixed across E0/E1/E2, so the
+  correct next step is the controlled GPU matrix on larger/real data rather than another unmeasured default flip.
+
+Research basis: FT-Transformer-style feature tokenization and numerical-feature embedding work motivate testing
+continuous numerical information separately from feature engineering. Retrieval-based tabular methods such as
+TabR are a later model-side experiment, not a preprocessing default, and should only be added if the controlled
+pipeline experiments show the remaining gap is model-capacity/interaction related rather than information loss.
+
+## 2026-09-19 — post-30k real-data leakage audit
+
+- Audited the large E2 fraud-performance gain before changing production defaults.
+- Behavioral features do not consume the target label.
+- Tightened point-in-time semantics from row-order-before to **timestamp-strictly-before** for cumulative and
+  sequence history; simultaneous transactions no longer see one another.
+- Added merchant-history point-in-time verification and regression tests.
+- Added natural-prevalence validation/test sampling (`validation_positive_share: null`,
+  `keep_all_test_positives: false`) while preserving enriched training.
+- Added `notebooks/AutoData_GPU_100K_Validation.ipynb` for the next T4 validation run.
+- `history+sequence` remains a candidate risk profile, not yet the universal default; promote only if the larger
+  natural-prevalence run confirms the gain and stability.
+
+
+## 2026-09-19 production-validation milestone
+
+- Full strict external holdout completed on all 555,719 rows of `fraudTest.csv` (2,145 positives).
+- `E2_full` mean external PR-AUC: **0.9352**, F1: **0.8582** across seeds 42/123/456.
+- `E1_continuous` mean external PR-AUC: **0.5715**; `E0_raw`: **0.3529**.
+- Point-in-time audit passed for card history, merchant history, and previous-transaction sequence features.
+- `financial_risk_default` is now a validated benchmark default. Next milestone: cross-schema validation on PaySim.
+- Full evidence and methodology: `reports/BENCHMARK_VALIDATION_REPORT_2026-09-19.md`.
+
+## 2026-09-19 — Adaptive feature-profile layer
+
+Added `src/profiling/feature_profile.py` to measure whether a source structurally supports behavioral history/sequence features before E2 is selected. The policy uses source structure only (entity repetition, strict prior-history coverage, counterparty repetition, time availability) and emits an auditable recommendation with reasons/warnings/confidence. It never uses benchmark/model scores to choose the current run's profile.
+
+Default conservative policy:
+- weak behavioral coverage -> E1 continuous;
+- sufficient repeated entity coverage -> enable E2 history;
+- sufficient strictly-earlier sequence coverage -> enable E2 sequence;
+- usable time may enable temporal context, but temporal-only E2 does not auto-promote above E1.
+
+Added `notebooks/AutoData_GPU_Adaptive_Profile_Benchmark.ipynb` for larger PaySim validation against fixed manual ablations, and `reports/ADAPTIVE_FEATURE_SELECTION.md` documenting rationale and thresholds. Automatic selection remains experimental until validated on larger PaySim and another structurally distinct source.
+
+## Performance optimization — 2026-09-20
+
+Adaptive multi-variant benchmarks were dominated by repeated preprocessing and behavioral feature generation rather than the small Transformer itself. The current build adds an opt-in shared `DataPreparer` cache across compatible variants, computes the full behavioral feature bank once for ablations, caches validation encodings, and enables CUDA AMP plus sampled-tensor GPU preloading. The adaptive PaySim notebook uses three seeds for core comparisons and one diagnostic seed for feature-family ablations by default. See `reports/PERFORMANCE_OPTIMIZATION_2026-09-20.md`.
+
+## 2026-09-20 — Adaptive cross-schema validation + pilot API boundary
+
+- PaySim larger adaptive benchmark confirmed the structural selector: AUTO recommended `E1_continuous` before training and E1 achieved the best tested natural PR-AUC (~0.1889), ahead of E2 temporal+history (~0.1152), E2 full (~0.0668) and raw E0 (~0.0145).
+- Added canonical semantic mapping (`target`, `entity`, `time`, `amount`, `category`, `counterparty`) with per-role confidence/evidence, explicit overrides, review warnings and fail-safe missing-role behavior.
+- Added FastAPI pilot service: `/health`, `/metadata`, `/profile`, `/validate`, `/prepare`.
+- `/prepare` returns an AI-ready split archive plus reproducibility manifest; Parquet is preferred, CSV is a runtime fallback when a parquet engine is absent.
+- Added non-root Docker image, healthcheck, CPU-compatible deployment path and upload format restrictions.
+- Training remains an offline benchmark/validation workflow; it is intentionally not exposed as a synchronous production API endpoint.
+- Focused regression/API tests: 13 passed. FastAPI TestClient smoke tests exercised profile and prepare with a third generic schema.

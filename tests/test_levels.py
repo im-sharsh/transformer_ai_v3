@@ -288,3 +288,147 @@ def test_build_caches_the_prepared_level(transactions):
     dp = DataPreparer(transactions, ps, lr, CFG, rows=500, seed=42)
     dp.prepare_split()
     assert dp.build("E1") is dp.build("E1")
+
+
+def test_e2_feature_groups_can_be_ablated_independently(transactions):
+    import copy
+    import yaml
+    from src.ingestion.roles import detect_roles, schema_for_profiling
+    from src.ingestion.schema_detector import detect_schema
+    from src.preprocessing.levels import DataPreparer, infer_roles
+
+    cfg = yaml.safe_load(open("config.yaml"))
+    schema = detect_schema(transactions, "groups")
+    roles = detect_roles(transactions, schema, target="is_fraud")
+    ps = schema_for_profiling(schema, roles, transactions)
+    inferred = infer_roles(transactions, ps, roles)
+
+    def build(groups):
+        c = copy.deepcopy(cfg)
+        c["features"]["enabled_groups"] = groups
+        p = DataPreparer(transactions, ps, inferred, c, rows=1200, seed=42)
+        p.prepare_split()
+        return p.build("E2")
+
+    temporal = build(["temporal"])
+    history = build(["history"])
+    sequence = build(["sequence"])
+    assert "hour" in temporal.features and "card_count_24h" not in temporal.features and "prev1_amount" not in temporal.features
+    assert "card_count_24h" in history.features and "hour" not in history.features and "prev1_amount" not in history.features
+    assert "prev1_amount" in sequence.features and "hour" not in sequence.features and "card_count_24h" not in sequence.features
+
+
+def test_history_and_sequence_exclude_same_timestamp_transactions():
+    """Transactions at the exact same timestamp are simultaneous: neither row may use the other as history."""
+    from src.features.behavioral_features import HistoryConfig, card_history, merchant_history, previous_transactions
+
+    df = pd.DataFrame({
+        "entity": ["A", "A", "A"],
+        "time": pd.to_datetime(["2026-01-01 10:00:00", "2026-01-01 11:00:00", "2026-01-01 11:00:00"]),
+        "amount": [10.0, 20.0, 999.0],
+        "category": ["food", "travel", "luxury"],
+        "merchant": ["m0", "m1", "m1"],
+    })
+    cfg = HistoryConfig(entity="entity", time="time", amount="amount", category="category", merchant="merchant",
+                        sequence_length=2)
+    card = card_history(df, cfg)
+    seq = previous_transactions(df, cfg)
+    merch = merchant_history(df, cfg)
+
+    # Both 11:00 rows may see only the 10:00 transaction for card/sequence history.
+    assert card.loc[1, "card_amount_mean_before"] == 10.0
+    assert card.loc[2, "card_amount_mean_before"] == 10.0
+    assert seq.loc[1, "prev1_amount"] == 10.0
+    assert seq.loc[2, "prev1_amount"] == 10.0
+    assert pd.isna(seq.loc[1, "prev2_amount"]) and pd.isna(seq.loc[2, "prev2_amount"])
+
+    # The two m1 transactions are the merchant's first simultaneous observations; neither can see the other.
+    assert pd.isna(merch.loc[1, "merchant_amount_mean_before"])
+    assert pd.isna(merch.loc[2, "merchant_amount_mean_before"])
+    assert merch.loc[1, "merchant_count_24h"] == 0.0
+    assert merch.loc[2, "merchant_count_24h"] == 0.0
+
+
+def test_runtime_point_in_time_audit_includes_merchant_history(transactions):
+    ps, roles = _prepare(transactions, "tx_merchant_pit")
+    lr = infer_roles(transactions, ps, roles)
+    dp = DataPreparer(transactions, ps, lr, CFG, rows=2000, seed=42)
+    dp.prepare_split()
+    e2 = dp.build("E2")
+    pit = e2.info["point_in_time"]
+    assert pit["passed"], pit
+    assert "merchant_history" in pit and pit["merchant_history"]["passed"], pit
+    assert pit["merchant_history"]["same_timestamp_policy"] == "strictly_earlier_only"
+
+
+def test_sampling_can_use_natural_prevalence_for_validation_and_test(transactions):
+    import copy
+    cfg = copy.deepcopy(CFG)
+    cfg["sampling"]["validation_positive_share"] = None
+    cfg["sampling"]["keep_all_test_positives"] = False
+    ps, roles = _prepare(transactions, "tx_natural_eval")
+    lr = infer_roles(transactions, ps, roles)
+    dp = DataPreparer(transactions, ps, lr, cfg, rows=3000, seed=42)
+    info = dp.prepare_split()
+    # Natural draws should report nearly identical sampled and weighted prevalence because class weights are ~1.
+    for split in ["validation", "test"]:
+        r = info["sample"][split]
+        assert abs(r["sample_positive_share"] - r["weighted_positive_rate"]) < 0.01, r
+
+
+def test_prepare_fixed_split_keeps_external_test_separate_and_natural(transactions):
+    """Strict external evaluation must never infer test membership from the combined corpus."""
+    df = transactions.iloc[:5000].copy().reset_index(drop=True)
+    ps, roles = _prepare(df, "fixed")
+    lr = infer_roles(df, ps, roles)
+    dp = DataPreparer(df, ps, lr, CFG, rows="full", seed=42)
+    ids = df.get("_row_id", pd.Series([f"r{i}" for i in range(len(df))]))
+    labels = pd.Series(index=ids, dtype="object")
+    labels.iloc[:3000] = "train"
+    labels.iloc[3000:4000] = "validation"
+    labels.iloc[4000:] = "test"
+    info = dp.prepare_fixed_split(labels, {"train": 1000, "validation": 500, "test": 500},
+                                  positive_share={"train": 0.10}, boundaries={"method": "unit-test fixed"})
+    assert info["fixed_split"] is True
+    assert set(dp.sample_ids["_split"]) == {"train", "validation", "test"}
+    assert (dp.sample_ids["_split"] == "test").sum() == 500
+    assert info["boundaries"]["method"] == "unit-test fixed"
+
+
+def test_strict_external_cleaning_uses_train_quality_scope(transactions):
+    """External mode must be usable end-to-end without fitting quality decisions on validation/test rows."""
+    ps, roles = _prepare(transactions, "strict_external")
+    lr = infer_roles(transactions, ps, roles)
+    cfg = {**CFG, "processing": {**CFG["processing"], "quality_fit_scope": "train", "strict_external_cleaning": True}}
+    dp = DataPreparer(transactions, ps, lr, cfg, rows=2500, seed=42)
+    dp.prepare_split()
+    e1 = dp.build("E1")
+    assert e1.frames["train"].shape[0] > 0 and e1.frames["test"].shape[0] > 0
+    assert "amt__robust" in e1.features
+
+
+def test_shared_preparation_cache_reuses_split_e1_and_history_across_variants(transactions):
+    """Ablation preparers must share expensive preprocessing without changing their outputs."""
+    df = transactions.iloc[:500].copy()
+    ps, roles = _prepare(df, "tx_shared_cache")
+    lr = infer_roles(df, ps, roles)
+    shared = {}
+
+    cfg_full = {**CFG, "features": {**CFG["features"], "enabled_groups": ["temporal", "history", "sequence"]}}
+    dp1 = DataPreparer(df, ps, lr, cfg_full, rows="full", seed=42, shared_cache=shared)
+    dp1.prepare_split()
+    e1_first = dp1.build("E1")
+    e2_full = dp1.build("E2")
+
+    cfg_history = {**CFG, "features": {**CFG["features"], "enabled_groups": ["history"]}}
+    dp2 = DataPreparer(df, ps, lr, cfg_history, rows="full", seed=42, shared_cache=shared)
+    dp2.prepare_split()
+    e1_second = dp2.build("E1")
+    e2_history = dp2.build("E2")
+
+    pd.testing.assert_frame_equal(e1_first.frames["train"], e1_second.frames["train"])
+    assert any(name == "e1_frame" for _, name in shared)
+    assert sum(str(name).startswith("history_full:") for _, name in shared) == 1
+    assert "prev1_amount" in e2_full.features
+    assert "prev1_amount" not in e2_history.features
+    assert e2_history.info["point_in_time"]["passed"]

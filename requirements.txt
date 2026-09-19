@@ -19,3 +19,8 @@ pytest>=8
 # peft>=0.12
 # accelerate>=0.33
 # bitsandbytes>=0.43     # Nemotron 4-bit quantization; CUDA GPU only, not installable/usable on CPU-only or macOS
+
+# Client-facing AutoData HTTP service
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9

@@ -65,8 +65,8 @@ split:                     # Phase 3: train/validation/test assignment, shared b
 
 sampling:                  # Phase 3: fixed experiment sample per split, drawn once and reused by every level
   train_positive_share: 0.10     # oversample the positive class in train/validation so small subsets still see it
-  validation_positive_share: 0.10
-  keep_all_test_positives: true  # test keeps every positive it can (up to max_test_positive_share) for reliable metrics
+  validation_positive_share: 0.10  # set null for a natural-prevalence validation sample
+  keep_all_test_positives: true  # set false for a natural-prevalence test sample; weighted research mode keeps positives
   max_test_positive_share: 0.5
 
 processing:                # Phase 3: E1 / E2 train-fitted transforms (missing values, rare categories, numeric)
@@ -74,7 +74,8 @@ processing:                # Phase 3: E1 / E2 train-fitted transforms (missing v
   n_bins: 10                     # decile bins for numeric transforms
   log_skew_threshold: 2.0        # log1p applied when training-set skewness exceeds this and the column is non-negative
 
-features:                  # Phase 3 (E2 history features); gracefully skipped if entity/time/amount are unavailable
+features:                  # Phase 3 (E2 feature groups); gracefully skipped when required roles are unavailable
+  enabled_groups: [temporal, history, sequence]  # research/ablation switch; supported: temporal, history, sequence
   windows: ["1h", "24h", "7d", "30d"]
   include_sequence_features: true  # audit finding 5: the entity's last `sequence_length` transactions
                                     # (hours ago / amount / hour / category), point-in-time verified. This
@@ -145,6 +146,8 @@ models:
                              # PROJECT_STATUS.md for the measured comparison.
     learning_rate: 0.0005
     batch_size: 256
+    amp: true                 # CUDA fast path: FP16 autocast + GradScaler; ignored on CPU
+    preload_to_device: true   # keep sampled training tensors on GPU to avoid per-batch PCIe copies
     epochs: 15
     patience: 3              # stop after this many epochs without a validation PR-AUC improvement
     seed: 42
@@ -187,3 +190,48 @@ models:
     endpoint: null            # e.g. https://your-service/predict ; null = unavailable until you set this
     batch_size: 32
     timeout_seconds: 30
+
+
+risk_profiles:              # Evidence-backed candidate profiles; validate externally before client deployment
+  financial_risk_default:
+    level: E2
+    feature_groups: [temporal, history, sequence]
+    numeric_mode: quantile_bin
+    status: validated_default
+    evidence: "full 555,719-row strict external holdout: PR-AUC 0.9352, F1 0.8582; point-in-time audit passed"
+  financial_risk_high_recall:
+    level: E2
+    feature_groups: [sequence]
+    numeric_mode: quantile_bin
+    status: optional_profile
+    evidence: "100k strict external holdout: strongest recall among tested profiles"
+  conservative_ai_ready:
+    level: E1
+    numeric_mode: continuous
+    status: fallback_profile
+    evidence: "strict external holdout: improves over raw baseline without behavioral E2 features"
+
+adapters:
+  paysim:
+    default_profile: strict
+    event_time_column: _autodata_event_time
+    time_unit: hour
+    target: isFraud
+    entity: nameOrig
+    amount: amount
+    category: type
+    counterparty: nameDest
+    strict_exclude: [oldbalanceOrg, newbalanceOrig, oldbalanceDest, newbalanceDest, isFlaggedFraud]
+    full_research_exclude: [isFlaggedFraud]
+
+adaptive_features:            # Dataset-structure profiler; recommendations are auditable and always overrideable
+  enabled: true
+  min_history_repeat_share: 0.25   # share of entity rows belonging to entities observed >=2 times
+  min_sequence_coverage: 0.10      # share of rows with >= sequence_length strictly earlier transactions
+  min_counterparty_repeat_share: 0.25
+  policy: conservative             # temporal-only E2 is not auto-selected; falls back to E1 continuous
+
+canonical_schema:
+  review_confidence_below: 0.70
+  supported_roles: [target, entity, time, amount, category, counterparty]
+  fail_closed_for_training: true

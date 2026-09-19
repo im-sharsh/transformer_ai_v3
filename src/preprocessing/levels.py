@@ -11,6 +11,9 @@ only, and every history feature uses only transactions strictly earlier in time.
 """
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
 import re
 import time
 from dataclasses import dataclass, field
@@ -140,7 +143,7 @@ class PreparedLevel:
 
 class DataPreparer:
     def __init__(self, df: pd.DataFrame, schema: SchemaReport, roles: Roles, config: dict, rows: int | str = 20000,
-                 seed: int = 42):
+                 seed: int = 42, shared_cache: dict | None = None):
         self.df = df.reset_index(drop=True)
         if "_row_id" not in self.df:
             self.df.insert(0, "_row_id", [f"r{i}" for i in range(len(self.df))])
@@ -150,6 +153,40 @@ class DataPreparer:
         self._history: pd.DataFrame | None = None
         self.pit: dict | None = None
         self.cache: dict = {}
+        # Optional in-process cache shared by multiple DataPreparer instances.  This is primarily used by
+        # ablation notebooks: E0/E1/E2 variants use the same rows and cleaning rules, so recomputing the
+        # split, E1 base frame, event times and behavioral families for every variant wastes most runtime.
+        # The cache is explicitly supplied by the caller; independent jobs remain isolated by default.
+        self.shared_cache = shared_cache if shared_cache is not None else {}
+        self._shared_key = self._make_shared_key()
+
+    def _make_shared_key(self) -> str:
+        """Lightweight compatibility key for shared preprocessing artifacts.
+
+        Feature-group and representation settings are intentionally excluded: they do not change the split or
+        E1 cleaning/base transforms.  Processing/sampling/split settings and semantic roles are included.
+        """
+        row_ids = self.df["_row_id"]
+        payload = {
+            "rows_total": int(len(self.df)),
+            "first_row_id": str(row_ids.iloc[0]) if len(row_ids) else None,
+            "last_row_id": str(row_ids.iloc[-1]) if len(row_ids) else None,
+            "rows_requested": self.rows,
+            "seed": int(self.seed),
+            "roles": self.roles.as_dict(),
+            "split": self.cfg.get("split", {}),
+            "sampling": self.cfg.get("sampling", {}),
+            "processing": self.cfg.get("processing", {}),
+        }
+        raw = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha1(raw).hexdigest()[:20]
+
+    def _shared_get(self, name: str):
+        return self.shared_cache.get((self._shared_key, name))
+
+    def _shared_set(self, name: str, value):
+        self.shared_cache[(self._shared_key, name)] = value
+        return value
 
     # ------------------------------------------------------------------ target, split, sample
     def _binary_target(self) -> pd.Series:
@@ -164,6 +201,11 @@ class DataPreparer:
         return (y.astype(str) == positive).astype(float).where(y.notna())
 
     def prepare_split(self) -> dict:
+        cached = self._shared_get("split")
+        if cached is not None:
+            self.sample_ids = cached["sample_ids"].copy(deep=False)
+            self.split_info = copy.deepcopy(cached["split_info"])
+            return self.split_info
         t0 = time.time()
         cfg, df = self.cfg, self.df
         f_train, f_val, _ = cfg["split"]["fractions"]
@@ -219,9 +261,14 @@ class DataPreparer:
                         break
                 if not progressed:
                     raise ValueError(f"Could not allocate the requested {n:,} rows across train/validation/test")
-            scfg = SampleConfig(sizes=sizes, positive_share={"train": s["train_positive_share"],
-                                                             "validation": s["validation_positive_share"]},
-                                include_all_positives={"test": s["keep_all_test_positives"]},
+            positive_share = {}
+            if s.get("train_positive_share") is not None:
+                positive_share["train"] = float(s["train_positive_share"])
+            if s.get("validation_positive_share") is not None:
+                positive_share["validation"] = float(s["validation_positive_share"])
+            include_all = {"test": True} if bool(s.get("keep_all_test_positives", False)) else {}
+            scfg = SampleConfig(sizes=sizes, positive_share=positive_share,
+                                include_all_positives=include_all,
                                 max_positive_share=s["max_test_positive_share"], seed=self.seed)
         sample = draw_sample(frame, "y", scfg)
         if self.roles.entity:
@@ -235,6 +282,69 @@ class DataPreparer:
                            "rows_unassigned": int((split == "unassigned").sum()),
                            "mode_rows": self.rows, "sample": sample_report(sample.rename(columns={"y": "is_y"}), "is_y"),
                            "seconds": round(time.time() - t0, 2)}
+        self._shared_set("split", {"sample_ids": self.sample_ids.copy(deep=False),
+                                   "split_info": copy.deepcopy(self.split_info)})
+        return self.split_info
+
+    def prepare_fixed_split(self, split_by_row_id: pd.Series, sizes: dict[str, int],
+                            positive_share: dict[str, float] | None = None,
+                            include_all_positives: dict[str, bool] | None = None,
+                            boundaries: dict | None = None) -> dict:
+        """Prepare a deterministic sample from caller-supplied split labels.
+
+        This is primarily for strict external evaluation: the caller can assign development rows to
+        train/validation and an entirely separate source to test, while reusing the exact same E0/E1/E2
+        preparation code.  No split is inferred from the external test source and no target information is
+        used to move rows between splits.  Statistical preprocessing is still fitted only on rows labelled
+        ``train`` by :meth:`_e1_frame`.
+
+        ``split_by_row_id`` must be indexed by ``_row_id`` and contain train/validation/test/unassigned.
+        ``sizes`` controls the sampled row count per split.  Omitting a split from ``positive_share`` keeps
+        that split at (approximately) its natural class prevalence.
+        """
+        t0 = time.time()
+        target = self._binary_target()
+        split = self.df["_row_id"].map(split_by_row_id).fillna("unassigned").astype("object")
+        allowed = {"train", "validation", "test", "unassigned"}
+        bad = sorted(set(split.dropna().unique()) - allowed)
+        if bad:
+            raise ValueError(f"Unsupported fixed split labels: {bad}")
+        split[target.isna()] = "unassigned"
+        frame = pd.DataFrame({"_row_id": self.df["_row_id"], "split": split, "y": target})
+        usable = frame[frame["split"] != "unassigned"]
+        available = usable["split"].value_counts().to_dict()
+        requested = {k: int(sizes.get(k, 0)) for k in ["train", "validation", "test"]}
+        for k, n in requested.items():
+            if n < 0 or n > int(available.get(k, 0)):
+                raise ValueError(f"Requested {n:,} rows from fixed split '{k}', but only {int(available.get(k, 0)):,} are available")
+        s = self.cfg["sampling"]
+        scfg = SampleConfig(
+            sizes=requested,
+            positive_share=dict(positive_share or {}),
+            include_all_positives=dict(include_all_positives or {}),
+            max_positive_share=s["max_test_positive_share"],
+            seed=self.seed,
+        )
+        sample = draw_sample(usable, "y", scfg)
+        if self.roles.entity:
+            train_entities = set(self.df.loc[split == "train", self.roles.entity])
+            entity_of = self.df.set_index("_row_id")[self.roles.entity]
+            sample["_new_entity"] = ~sample["_row_id"].map(entity_of).isin(train_entities)
+        else:
+            sample["_new_entity"] = False
+        self.sample_ids = sample.rename(columns={"split": "_split", "y": "_target"})
+        self.split_info = {
+            "boundaries": boundaries or {"method": "caller-supplied fixed split"},
+            "rows_available": int(len(self.df)),
+            "rows_unassigned": int((split == "unassigned").sum()),
+            "mode_rows": int(sum(requested.values())),
+            "sample": sample_report(sample.rename(columns={"y": "is_y"}), "is_y"),
+            "seconds": round(time.time() - t0, 2),
+            "fixed_split": True,
+        }
+        self.cache.clear()
+        self._history = None
+        self.pit = None
         return self.split_info
 
     def _sample_rows(self) -> pd.DataFrame:
@@ -288,14 +398,36 @@ class DataPreparer:
         return self._finish("E0", rows, features, steps, extra)
 
     def _e1_frame(self) -> tuple[pd.DataFrame, list, list, dict]:
+        cached = self._shared_get("e1_frame")
+        if cached is not None:
+            # Shallow frame copy is enough: E2 only adds columns or merges into a new frame; it never mutates
+            # existing E1 columns in place. This avoids duplicating a million-row frame for every ablation.
+            return (cached["frame"].copy(deep=False), list(cached["numeric"]), list(cached["categorical"]),
+                    copy.deepcopy(cached["extra"]))
         r, cfg = self.roles, self.cfg
         rows = self._sample_rows()
         content_cols = [c for c in self.df.columns if c != "_row_id"]
         content = rows[content_cols]
-        quality = assess_quality(content, self.schema)
+        # Strict external evaluation must not let holdout/test covariates influence data-quality decisions
+        # such as whether a redundant column is dropped.  Default remains the historical sampled-frame
+        # behaviour for backwards compatibility; external notebooks set quality_fit_scope="train".
+        quality_scope = cfg.get("processing", {}).get("quality_fit_scope", "sample")
+        if quality_scope not in {"sample", "train"}:
+            raise ValueError("processing.quality_fit_scope must be 'sample' or 'train'")
+        quality_input = content[rows["_split"].to_numpy() == "train"] if quality_scope == "train" else content
+        quality = assess_quality(quality_input, self.schema)
         protected = rows["_split"] != "train"
+        clean_cfg = CleaningConfig()
+        if cfg.get("processing", {}).get("strict_external_cleaning", False):
+            # These three cleaner operations infer corpus-level conventions (modal code width, canonical
+            # category spelling, shared prefixes).  Disable them in strict external mode rather than infer
+            # conventions from the untouched holdout.  Train-fitted missing/category/numeric transforms
+            # still run below through FittedPreprocessor.
+            clean_cfg.zero_pad_codes = False
+            clean_cfg.merge_case_variants = False
+            clean_cfg.strip_shared_prefixes = False
         cleaning = clean_dataset(rows[["_row_id"] + content_cols].assign(_split=rows["_split"]), self.schema, quality,
-                                 protected=protected, config=CleaningConfig())
+                                 protected=protected, config=clean_cfg)
         cleaned = cleaning.df.merge(rows[["_row_id", "_target", "_weight", "_new_entity"]], on="_row_id", how="left")
         steps = [f"Quality score on sampled rows: {quality.scores['overall']:.1f}",
                  f"Cleaning: {cleaning.summary['rows_in']:,} rows in, {cleaning.summary['rows_quarantined']:,} quarantined, "
@@ -337,7 +469,10 @@ class DataPreparer:
                   "Absolute timestamps removed from model inputs: later periods lie outside the training range"]
         audit = {"cleaning": cleaning.summary, "audit_log": cleaning.audit.entries, "preprocessor": pre.to_dict(),
                  "transform_stats": stats, "quality_scores": quality.scores}
-        return transformed, numeric_features, categorical, {"steps": steps, "audit": audit}
+        extra = {"steps": steps, "audit": audit}
+        self._shared_set("e1_frame", {"frame": transformed, "numeric": list(numeric_features),
+                                      "categorical": list(categorical), "extra": copy.deepcopy(extra)})
+        return transformed.copy(deep=False), numeric_features, categorical, extra
 
     def _run_leakage(self, level: str, frame: pd.DataFrame, features: list) -> tuple[list, list, str]:
         """Full feature-level leakage scan (Phase 4) on the level's final feature set. Needs a datetime column
@@ -373,10 +508,33 @@ class DataPreparer:
         return self._finish("E1", frame, kept, extra["steps"], extra)
 
     def _event_times(self, frame):
-        times = parse_datetime_column(self.df.set_index("_row_id")[self.roles.time], "datetime")
+        times = self._shared_get("event_times")
+        if times is None:
+            times = parse_datetime_column(self.df.set_index("_row_id")[self.roles.time], "datetime")
+            self._shared_set("event_times", times)
         return frame["_row_id"].map(times)
 
     def _history_features(self) -> pd.DataFrame | None:
+        """Return the full behavioral feature bank, computed once per shared dataset/split.
+
+        Earlier versions built only the currently enabled feature families.  Ablation notebooks therefore
+        recomputed expensive multi-million-row rolling/groupby work for E2_full, E2_history and E2_sequence.
+        The full bank is now cached once and each E2 variant selects only the columns it needs.
+        """
+        fcfg = self.cfg["features"]
+        history_sig = hashlib.sha1(json.dumps({
+            "windows": fcfg.get("windows", []),
+            "sequence_length": int(fcfg.get("sequence_length", 3)),
+            "include_sequence_features": bool(fcfg.get("include_sequence_features", True)),
+            "entity": self.roles.entity, "time": self.roles.time, "amount": self.roles.amount,
+            "category": self.roles.category, "merchant": self.roles.merchant,
+        }, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:12]
+        history_cache_name = f"history_full:{history_sig}"
+        cached = self._shared_get(history_cache_name)
+        if cached is not None:
+            self._history = cached["frame"]
+            self.pit = copy.deepcopy(cached["pit"])
+            return self._history
         if self._history is not None:
             return self._history
         r = self.roles
@@ -390,8 +548,6 @@ class DataPreparer:
         base = base.dropna(subset=["time"])
         if base.empty:
             return None
-        fcfg = self.cfg["features"]
-        use_sequence = bool(fcfg.get("include_sequence_features", True))
         seq_len = int(fcfg.get("sequence_length", 3))
         hc = HistoryConfig(entity="entity", time="time", amount="amount", category="category" if r.category else None,
                            merchant="merchant" if r.merchant else None, windows=tuple(fcfg["windows"]),
@@ -399,55 +555,70 @@ class DataPreparer:
         parts = [card_history(base, hc)]
         if r.merchant:
             parts.append(merchant_history(base, hc))
-        if use_sequence:
-            # Audit finding 5: these prevK_* columns (the entity's last K transactions) were already implemented
-            # and leakage-tested but never reached E2 in the original pipeline. Wired in here because a separate
-            # experiment (fine-tuning a language model on the equivalent text representation) found this to be
-            # the single largest effect measured in that research: PR-AUC 0.87 vs 0.61-0.65 for aggregate-only
-            # history, same seed, statistically significant. Point-in-time verified below like every other
-            # history feature.
+        if bool(fcfg.get("include_sequence_features", True)):
             parts.append(previous_transactions(base, hc))
         hist = pd.concat(parts, axis=1)
         hist.insert(0, "_row_id", base["_row_id"].values)
-        # point-in-time verification on a few entities: recomputes history from truncated data and compares
+
+        # Run each point-in-time family check once and share the result across all ablations.
         ents = base["entity"].drop_duplicates().sample(min(10, base["entity"].nunique()), random_state=self.seed)
         sub = base[base["entity"].isin(ents)]
-        pit_card = check_point_in_time(sub, lambda f: card_history(f, hc), "time", "entity", n_samples=min(100, len(sub)))
-        if use_sequence:
-            pit_seq = check_point_in_time(sub, lambda f: previous_transactions(f, hc), "time", "entity",
-                                          n_samples=min(100, len(sub)))
-            self.pit = {"card_history": pit_card, "previous_transactions": pit_seq,
-                       "passed": bool(pit_card["passed"] and pit_seq["passed"]), "rows_checked": pit_card["rows_checked"]}
-        else:
-            self.pit = {"card_history": pit_card, "passed": bool(pit_card["passed"]), "rows_checked": pit_card["rows_checked"]}
+        checks = {
+            "card_history": check_point_in_time(
+                sub, lambda f: card_history(f, hc), "time", "entity", n_samples=min(100, len(sub)))
+        }
+        if r.merchant:
+            merchant_sub = base[base["merchant"].isin(
+                base["merchant"].drop_duplicates().sample(min(10, base["merchant"].nunique()), random_state=self.seed)
+            )]
+            checks["merchant_history"] = check_point_in_time(
+                merchant_sub, lambda f: merchant_history(f, hc), "time", "merchant",
+                n_samples=min(100, len(merchant_sub)))
+        if bool(fcfg.get("include_sequence_features", True)):
+            checks["previous_transactions"] = check_point_in_time(
+                sub, lambda f: previous_transactions(f, hc), "time", "entity", n_samples=min(100, len(sub)))
+        passed = all(v["passed"] for v in checks.values())
+        rows_checked = max((v["rows_checked"] for v in checks.values()), default=0)
+        self.pit = {**checks, "passed": bool(passed), "rows_checked": rows_checked, "checks": sorted(checks)}
         self._history = hist
+        self._shared_set(history_cache_name, {"frame": hist, "pit": copy.deepcopy(self.pit)})
         return hist
 
     def _build_e2(self) -> PreparedLevel:
         frame, numeric, categorical, extra = self._e1_frame()
         r = self.roles
+        fcfg = self.cfg["features"]
+        enabled = set(fcfg.get("enabled_groups", ["temporal", "history", "sequence"]))
+        unknown = enabled - {"temporal", "history", "sequence"}
+        if unknown:
+            raise ValueError(f"features.enabled_groups contains unsupported values: {sorted(unknown)}")
+
         temporal_cols = []
-        if r.time:
-            t = self._event_times(frame)
-            hour, dow = t.dt.hour.astype("float64"), t.dt.dayofweek.astype("float64")
-            temporal = {"hour": hour, "day_of_week": dow, "month": t.dt.month.astype("float64"),
-                       "is_weekend": (dow >= 5).astype("float64"),
-                       "hour_sin": np.sin(2 * np.pi * hour / 24), "hour_cos": np.cos(2 * np.pi * hour / 24),
-                       "day_of_week_sin": np.sin(2 * np.pi * dow / 7), "day_of_week_cos": np.cos(2 * np.pi * dow / 7)}
-            for name, values in temporal.items():
-                frame[name] = values
-            temporal_cols = list(temporal)
+        if r.time and "temporal" in enabled:
+            temporal_frame = self._shared_get("temporal_features")
+            if temporal_frame is None:
+                t = self._event_times(frame)
+                hour, dow = t.dt.hour.astype("float64"), t.dt.dayofweek.astype("float64")
+                temporal = {"hour": hour, "day_of_week": dow, "month": t.dt.month.astype("float64"),
+                           "is_weekend": (dow >= 5).astype("float64"),
+                           "hour_sin": np.sin(2 * np.pi * hour / 24), "hour_cos": np.cos(2 * np.pi * hour / 24),
+                           "day_of_week_sin": np.sin(2 * np.pi * dow / 7), "day_of_week_cos": np.cos(2 * np.pi * dow / 7)}
+                temporal_frame = pd.DataFrame({"_row_id": frame["_row_id"], **temporal})
+                self._shared_set("temporal_features", temporal_frame)
+            temporal_cols = [c for c in TIME_FEATURES if c in temporal_frame]
+            frame = frame.merge(temporal_frame[["_row_id"] + temporal_cols], on="_row_id", how="left")
             extra["steps"].append(f"Time features (raw and cyclical): {temporal_cols}")
         else:
-            extra["steps"].append("Time features skipped: no datetime column selected")
+            reason = "disabled by features.enabled_groups" if "temporal" not in enabled else "no datetime column selected"
+            extra["steps"].append(f"Time features skipped: {reason}")
 
         hist_cols, seq_numeric, seq_categorical = [], [], []
-        if r.entity and r.time and r.amount:
+        history_requested = bool({"history", "sequence"} & enabled)
+        if history_requested and r.entity and r.time and r.amount:
             hist = self._history_features()
             if hist is not None:
-                hist_cols = [c for c in HISTORY_FEATURES if c in hist]
-                fcfg = self.cfg["features"]
-                if fcfg.get("include_sequence_features", True):
+                hist_cols = [c for c in HISTORY_FEATURES if c in hist] if "history" in enabled else []
+                if "sequence" in enabled and fcfg.get("include_sequence_features", True):
                     seq_len = int(fcfg.get("sequence_length", 3))
                     for k in range(1, seq_len + 1):
                         for suffix, numeric_kind in [("hours_ago", True), ("amount", True), ("hour", True),
@@ -462,18 +633,29 @@ class DataPreparer:
                           if seq_numeric or seq_categorical else "")
                 extra["steps"].append(f"History features from strictly earlier transactions of the same {r.entity} "
                                       f"(no past labels): {len(hist_cols)} aggregate features{seq_msg}")
-                extra["steps"].append(f"Point-in-time check on real rows: {'passed' if self.pit['passed'] else 'FAILED'} "
-                                      f"({self.pit['rows_checked']} rows)")
-                extra["point_in_time"] = self.pit
+                selected_checks = []
+                if "history" in enabled:
+                    selected_checks += [k for k in ["card_history", "merchant_history"] if k in self.pit]
+                if "sequence" in enabled and "previous_transactions" in self.pit:
+                    selected_checks.append("previous_transactions")
+                selected_pit = {k: copy.deepcopy(self.pit[k]) for k in selected_checks}
+                selected_pit["passed"] = all(self.pit[k]["passed"] for k in selected_checks) if selected_checks else True
+                selected_pit["rows_checked"] = max((self.pit[k]["rows_checked"] for k in selected_checks), default=0)
+                selected_pit["checks"] = selected_checks
+                extra["steps"].append(f"Point-in-time check on real rows: {'passed' if selected_pit['passed'] else 'FAILED'} "
+                                      f"({selected_pit['rows_checked']} rows)")
+                extra["point_in_time"] = selected_pit
             else:
-                extra["steps"].append("History features skipped: no rows have a valid event time")
-        else:
+                extra["steps"].append("History/sequence features skipped: no enabled features were produced or no rows have a valid event time")
+        elif history_requested:
             missing = [name for name, v in [("entity", r.entity), ("time", r.time), ("amount", r.amount)] if not v]
-            extra["steps"].append(f"History features skipped: no {', '.join(missing)} column selected")
+            extra["steps"].append(f"History/sequence features skipped: no {', '.join(missing)} column selected")
+        else:
+            extra["steps"].append("History/sequence features skipped: disabled by features.enabled_groups")
         feats = numeric + temporal_cols + hist_cols + seq_numeric + categorical + seq_categorical
         findings, removed, msg = self._run_leakage("E2", frame, feats)
-        if hist_cols:
-            msg += " (history features are additionally verified point-in-time above)"
+        if hist_cols or seq_numeric or seq_categorical:
+            msg += " (history/sequence features are additionally verified point-in-time above)"
         extra["steps"].append(msg)
         extra["leakage"] = findings
         return self._finish("E2", frame, [c for c in feats if c not in removed], extra["steps"], extra)

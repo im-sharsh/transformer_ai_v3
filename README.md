@@ -221,3 +221,71 @@ Additional datasets beyond the fraud case study (churn, credit risk) end to end 
 and regression support in Processing/Model/Experiments; database connectors; streaming transactions; richer
 experiment tracking (currently one JSON manifest per comparison); drift detection; privacy/PII scanning beyond
 the current detection-and-masking; production deployment.
+
+### Pretrained GPU fine-tuning benchmark
+
+`notebooks/pretrained_gpu_finetuning.ipynb` provides a Colab/Kaggle GPU path for comparing E0/E1/E2 with a
+pretrained sequence-classification Transformer. It starts with `distilbert/distilbert-base-uncased` and supports
+frozen-head, LoRA/PEFT, and optional full fine-tuning. The notebook deliberately reuses one deterministic subset
+and split across all processing levels; pretrained models tokenize the rendered row text with their own tokenizer
+rather than consuming the built-in Transformer's Step-11 token IDs.
+
+### AutoData GPU research benchmark
+
+`notebooks/AutoData_GPU_Research_Benchmark.ipynb` is the recommended Colab notebook for the current
+raw-vs-AI-ready investigation. It runs the repository's real backend modules on CUDA, not a reimplemented
+notebook-only pipeline. The notebook:
+
+- robustly locates an extracted project or accepts the latest project ZIP directly;
+- builds E0/E1/E2 from one deterministic split/sample;
+- runs representation/signal diagnostics before expensive training;
+- compares E0/E1/E2 across multiple seeds on GPU;
+- ablates E2 temporal, history, and previous-transaction sequence feature groups independently;
+- tests continuous numeric representation against the current quantile-token baseline;
+- exports a reproducible CSV result matrix and JSON run context under `experiments/colab_gpu/`.
+
+For fraud work, use PR-AUC as the primary comparison metric and inspect seed-to-seed variance. Do not promote a
+pipeline change to the default from one seed or one dataset.
+
+### Post-audit GPU validation
+
+After the 30k real-data research matrix, use `notebooks/AutoData_GPU_100K_Validation.ipynb` for the next T4 run.
+It keeps fraud-enriched training but evaluates validation/test at natural prevalence, requires the stricter
+point-in-time audit to pass, and compares only E0 raw, E1 continuous, E2 full, E2 history, E2 sequence, and
+E2 history+sequence. See `reports/leakage_audit_2026-09-19.md` for the rationale.
+
+### Strict external GPU evaluation
+After internal validation, use `notebooks/AutoData_GPU_External_Holdout.ipynb` to train/select thresholds on `fraudTrain.csv` and score `fraudTest.csv` as a fixed external holdout. See `reports/external_holdout_plan.md` for the leakage controls and interpretation rules.
+
+## Cross-schema benchmark: PaySim
+
+The validated financial-risk baseline can now be tested on PaySim without changing downstream E0/E1/E2 code. `src/ingestion/adapters.py` maps PaySim's hourly `step` clock and transaction roles explicitly. Run `notebooks/AutoData_GPU_PaySim_Benchmark.ipynb` in Colab. Start with the `strict` profile; use `full_research` only as an ablation for simulator-specific balance fields. See `reports/PAYSIM_ADAPTER_PLAN.md` and the benchmark validation report in `reports/`.
+
+## Pilot API / canonical schema layer
+
+The validated data pipeline can also be run behind a small FastAPI boundary:
+
+```bash
+uvicorn api_server:app --host 0.0.0.0 --port 8000
+```
+
+or:
+
+```bash
+docker build -t autodata .
+docker run --rm -p 8000:8000 autodata
+```
+
+Endpoints:
+
+- `GET /health`
+- `GET /metadata`
+- `POST /profile`
+- `POST /validate`
+- `POST /prepare`
+
+`/profile` returns schema inference, a canonical semantic mapping and the adaptive E1/E2 recommendation. Canonical roles are `target`, `entity`, `time`, `amount`, `category`, and `counterparty`; uncertain mappings are reported rather than silently invented. A client can supply explicit JSON overrides.
+
+`/prepare` is intended for pilot-sized synchronous jobs and returns a ZIP containing train/validation/test AI-ready files plus `manifest.json`. The manifest records the mapping, recommendation, selected processing level, representation/feature groups, split information and point-in-time audit. Large production jobs should move to an asynchronous job/queue execution model.
+
+The HTTP API is CPU-compatible. CUDA accelerates benchmark/model execution when available but is not a product dependency.

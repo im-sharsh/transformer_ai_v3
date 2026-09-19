@@ -5,6 +5,7 @@ compete with large language models). Runs on CPU for demo-sized data.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import time
@@ -94,6 +95,27 @@ class SanityTransformerAdapter(ModelAdapter):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.tokenizer: TabularTokenizer | None = None
         self.model: SanityTransformerModel | None = None
+        self._encoded_cache: dict[int, tuple] = {}
+        self.use_amp = bool(self.mcfg.get("amp", True)) and str(self.device).startswith("cuda")
+
+    def _autocast(self):
+        if not self.use_amp:
+            return contextlib.nullcontext()
+        # torch.autocast is the current API; cuda.amp.autocast remains the compatibility fallback.
+        if hasattr(torch, "autocast"):
+            return torch.autocast(device_type="cuda", dtype=torch.float16)
+        return torch.cuda.amp.autocast(dtype=torch.float16)
+
+    def _encode_frame(self, frame: pd.DataFrame):
+        """Tokenize a frame once per adapter; validation is reused across every epoch."""
+        key = id(frame)
+        cached = self._encoded_cache.get(key)
+        if cached is not None:
+            return cached
+        ids = torch.from_numpy(self.tokenizer.transform(frame))
+        nv, nm = self._numeric_tensors(frame)
+        self._encoded_cache[key] = (ids, nv, nm)
+        return ids, nv, nm
 
     def describe(self) -> dict:
         n = sum(p.numel() for p in self.model.parameters()) if self.model else None
@@ -101,6 +123,7 @@ class SanityTransformerAdapter(ModelAdapter):
                 **{k: self.mcfg[k] for k in ["d_model", "n_heads", "n_layers", "pooling"]}}
 
     def _build(self, prepared):
+        self._encoded_cache.clear()
         numeric_mode = self.rcfg.get("numeric_mode", "quantile_bin")
         coarse_bins = self.rcfg.get("numeric_coarse_bins", 0)
         numeric_clip = self.rcfg.get("numeric_clip")
@@ -126,14 +149,17 @@ class SanityTransformerAdapter(ModelAdapter):
     @torch.no_grad()
     def predict(self, frame: pd.DataFrame, batch_size: int = 1024) -> np.ndarray:
         self.model.eval()
-        ids = torch.from_numpy(self.tokenizer.transform(frame))
-        nv, nm = self._numeric_tensors(frame)
+        ids, nv, nm = self._encode_frame(frame)
         out = []
         for i in range(0, len(ids), batch_size):
             kwargs = {}
             if nv is not None:
-                kwargs = {"numeric_values": nv[i:i + batch_size].to(self.device), "numeric_mask": nm[i:i + batch_size].to(self.device)}
-            out.append(torch.sigmoid(self.model(ids[i:i + batch_size].to(self.device), **kwargs)).double().cpu().numpy())
+                kwargs = {"numeric_values": nv[i:i + batch_size].to(self.device, non_blocking=True),
+                          "numeric_mask": nm[i:i + batch_size].to(self.device, non_blocking=True)}
+            xb = ids[i:i + batch_size].to(self.device, non_blocking=True)
+            with self._autocast():
+                logits = self.model(xb, **kwargs)
+            out.append(torch.sigmoid(logits.float()).double().cpu().numpy())
         return np.concatenate(out) if out else np.array([])
 
     def train(self, prepared, settings: dict, progress=None) -> dict:
@@ -145,10 +171,17 @@ class SanityTransformerAdapter(ModelAdapter):
         torch.set_num_threads(1)
         torch.manual_seed(seed); np.random.seed(seed)
         self._build(prepared)
+        self.use_amp = bool(s.get("amp", self.mcfg.get("amp", True))) and str(self.device).startswith("cuda")
         train, val = prepared.frames["train"], prepared.frames["validation"]
-        x = torch.from_numpy(self.tokenizer.transform(train))
-        x_nv, x_nm = self._numeric_tensors(train)
+        x, x_nv, x_nm = self._encode_frame(train)
         y = torch.tensor(train["_target"].to_numpy(dtype="float32"))
+        preload = bool(s.get("preload_to_device", self.mcfg.get("preload_to_device", True))) and str(self.device).startswith("cuda")
+        if preload:
+            x = x.to(self.device)
+            y = y.to(self.device)
+            if x_nv is not None:
+                x_nv = x_nv.to(self.device)
+                x_nm = x_nm.to(self.device)
         opt = torch.optim.AdamW(self.model.parameters(), lr=float(s["learning_rate"]), weight_decay=0.01)
         # Audit finding 4: the sampler oversamples the positive class (sampling.train_positive_share, e.g. 10%
         # against a true ~0.6% rate) and computes an inverse-probability `_weight` per row to correct for this
@@ -178,28 +211,46 @@ class SanityTransformerAdapter(ModelAdapter):
         loss_fn = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight.to(self.device) if pos_weight is not None else None)
         sample_weight = (torch.tensor(train["_weight"].to_numpy(dtype="float32"))
                          if class_weighting == "sample_weight" and "_weight" in train else None)
+        if preload and sample_weight is not None:
+            sample_weight = sample_weight.to(self.device)
+        try:
+            scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+        except (AttributeError, TypeError):
+            scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
         g = torch.Generator().manual_seed(seed)
         history, best, best_state, bad_epochs = [], -1.0, None, 0
         t0 = time.time()
         for epoch in range(int(s["epochs"])):
             self.model.train()
             perm = torch.randperm(len(x), generator=g)
+            if preload:
+                perm = perm.to(self.device)
             total, n = 0.0, 0
             for i in range(0, len(x), int(s["batch_size"])):
                 idx = perm[i:i + int(s["batch_size"])]
                 kwargs = {}
+                xb = x[idx] if preload else x[idx].to(self.device, non_blocking=True)
+                yb = y[idx] if preload else y[idx].to(self.device, non_blocking=True)
                 if x_nv is not None:
-                    kwargs = {"numeric_values": x_nv[idx].to(self.device), "numeric_mask": x_nm[idx].to(self.device)}
-                logits = self.model(x[idx].to(self.device), **kwargs)
-                losses = loss_fn(logits, y[idx].to(self.device))
-                if sample_weight is not None:
-                    w = sample_weight[idx].to(self.device)
-                    loss = (losses * w).sum() / w.sum()
-                else:
-                    loss = losses.mean()
-                opt.zero_grad(); loss.backward()
+                    if preload:
+                        kwargs = {"numeric_values": x_nv[idx], "numeric_mask": x_nm[idx]}
+                    else:
+                        kwargs = {"numeric_values": x_nv[idx].to(self.device, non_blocking=True),
+                                  "numeric_mask": x_nm[idx].to(self.device, non_blocking=True)}
+                with self._autocast():
+                    logits = self.model(xb, **kwargs)
+                    losses = loss_fn(logits, yb)
+                    if sample_weight is not None:
+                        w = sample_weight[idx] if preload else sample_weight[idx].to(self.device, non_blocking=True)
+                        loss = (losses * w).sum() / w.sum()
+                    else:
+                        loss = losses.mean()
+                opt.zero_grad(set_to_none=True)
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                opt.step()
+                scaler.step(opt)
+                scaler.update()
                 total += loss.item() * len(idx); n += len(idx)
             pv = self.predict(val)
             vm = classification_metrics(val["_target"], pv, val["_weight"], 0.5)
